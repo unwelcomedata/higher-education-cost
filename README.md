@@ -1,5 +1,14 @@
 # higher-education-cost
 
+How the cost of college has changed over time, and where the money actually
+goes — administration vs instruction ("admin vs classroom") — broken down by
+state and by institution. Built on IPEDS (NCES) tuition and finance data,
+College Scorecard cost/outcomes data, and BLS CPI for inflation adjustment.
+
+See [SOURCES.md](SOURCES.md) for full source attribution and known
+methodology hazards (notably GASB vs FASB accounting differences and the
+definitional choice of what counts as "admin").
+
 > **AI-Assisted Development**
 > This project was built with the assistance of [Kiro](https://kiro.dev),
 > an AI-powered development environment. All data sourcing decisions,

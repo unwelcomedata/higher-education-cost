@@ -20,11 +20,38 @@ sources:
   # type:       html_table | html_scrape | csv | json
   # table_index: (html_table only) zero-based index of the target <table>
   # js_render:  true if the page requires Playwright (JS-rendered)
-  # Example:
-  # fatalities:
-  #   url: https://example.gov/data/fatalities
-  #   type: html_table
-  #   table_index: 0
+  #
+  # NOTE: IPEDS survey files are downloaded per-year from the IPEDS Data Center
+  # complete-data-files page. The exact download URLs are year- and survey-
+  # specific; confirm each in 01-ingest before wiring them in here. The entries
+  # below are placeholders documenting intent — verify URLs/structure first.
+
+  # --- IPEDS (NCES) — authoritative source for tuition + finance ---
+  # Complete data files: https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx
+  # ipeds_ic_charges:        # Institutional Characteristics — tuition & fees (sticker price)
+  #   url: TODO   # per-year zip from IPEDS Data Center
+  #   type: csv
+  #   js_render: false
+  # ipeds_finance:           # Finance survey (F) — expenses by function (instruction vs institutional support)
+  #   url: TODO   # separate files for GASB (public) and FASB (private) — handle both
+  #   type: csv
+  #   js_render: false
+  # ipeds_enrollment:        # EF/EFFY — enrollment for per-FTE normalization
+  #   url: TODO
+  #   type: csv
+  #   js_render: false
+
+  # --- College Scorecard (U.S. Dept. of Education) — modern cost + outcomes ---
+  # Bulk data: https://collegescorecard.ed.gov/data/
+  # scorecard:
+  #   url: https://ed-public-download.app.cloud.gov/downloads/CollegeScorecard_Raw_Data.zip
+  #   type: csv
+  #   js_render: false
+
+  # --- BLS CPI-U — inflation adjustment ---
+  # cpi_u:
+  #   url: https://download.bls.gov/pub/time.series/cu/cu.data.1.AllItems
+  #   type: csv
   #   js_render: false
 
 export:
