@@ -11,8 +11,10 @@ to get paths and source definitions from config.yaml.
 
 from __future__ import annotations
 
+import io
 import json
 import time
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -304,3 +306,157 @@ def ingest_source(
         return parse_html_scrape(html, row_selector, field_map)
 
     raise ValueError(f"Unknown source type '{source_type}'. Use: html_table, html_scrape, csv, json.")
+
+
+# ---------------------------------------------------------------------------
+# Project-specific ingest — higher-education-cost
+# ---------------------------------------------------------------------------
+#
+# Three authoritative U.S. federal sources (all public domain):
+#   1. IPEDS (NCES)         — per-survey, per-year ZIPs of CSVs.
+#   2. College Scorecard    — one bulk ZIP (Dept. of Education).
+#   3. BLS CPI-U            — via the BLS public timeseries API (the
+#                             download.bls.gov flat-file host hard-blocks
+#                             automated GETs with a 403, so the API is used).
+#
+# Every function DOWNLOADS the source file verbatim into data/raw/ and returns
+# a DataFrame of the raw contents. NO cleaning/transformation happens here —
+# that is the job of the 02-clean stage.
+
+
+def download_ipeds_survey(survey_file: str, cfg: dict, timeout: int = 120) -> Path:
+    """Download one IPEDS complete-data-file ZIP into data/raw/ verbatim.
+
+    IPEDS Data Center serves each survey component, each collection year, as a
+    zipped CSV at a stable URL pattern:
+
+        https://nces.ed.gov/ipeds/datacenter/data/<SURVEY_FILE>.zip
+
+    where <SURVEY_FILE> is e.g. HD2022, IC2022_AY, F2122_F1A, F2122_F2, EFFY2022.
+    (Confirmed live 2026-09-30 — all return 200 + application/x-zip-compressed.)
+
+    Args:
+        survey_file: IPEDS file stem WITHOUT the .zip extension (e.g. "HD2022").
+        cfg:         Loaded config dict.
+        timeout:     Request timeout in seconds (IPEDS ZIPs can be several MB).
+
+    Returns:
+        Path to the downloaded ZIP in data/raw/.
+    """
+    url = f"https://nces.ed.gov/ipeds/datacenter/data/{survey_file}.zip"
+    dest = raw_path(cfg, f"ipeds/{survey_file}.zip")
+    time.sleep(1.5)  # workspace rate-limit rule (>=1.0s)
+    download_file(url, dest, timeout=timeout)
+    return dest
+
+
+def read_ipeds_zip(zip_path: Path) -> pd.DataFrame:
+    """Read the primary CSV out of an IPEDS survey ZIP into a DataFrame.
+
+    IPEDS ZIPs contain the data CSV (named like the file stem, lowercased) and
+    sometimes a "_rv" revised-data variant. This reads the main (non-_rv) CSV.
+    The raw ZIP on disk is the untouched artifact; this is just to load it for
+    inspection / DuckDB registration.
+    """
+    with zipfile.ZipFile(zip_path) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise ValueError(f"No CSV inside {zip_path}")
+        # Prefer the non-revised file if both exist (e.g. hd2022.csv vs hd2022_rv.csv)
+        primary = sorted(csv_names, key=lambda n: ("_rv" in n.lower(), len(n)))[0]
+        with zf.open(primary) as fh:
+            # latin-1: IPEDS CSVs occasionally carry non-UTF-8 bytes in text fields.
+            df = pd.read_csv(io.BytesIO(fh.read()), encoding="latin-1", low_memory=False)
+    return df
+
+
+def ingest_scorecard(cfg: dict, timeout: int = 300) -> tuple[Path, pd.DataFrame]:
+    """Download the College Scorecard 'Most Recent Institution-Level Data' ZIP.
+
+    The bulk host moved from ed-public-download.app.cloud.gov (now 404) to
+    ed-public-download.scorecard.network (confirmed live 2026-09-30 via the
+    data.ed.gov CKAN package listing). The ZIP holds a single CSV with every
+    Title IV institution's most-recent cohort: net price, cost of attendance,
+    completion rate, and post-enrollment earnings.
+
+    Returns:
+        (path_to_zip_in_data_raw, dataframe_of_the_csv_inside).
+    """
+    url = cfg["sources"]["scorecard"]["url"]
+    dest = raw_path(cfg, "scorecard/Most-Recent-Cohorts-Institution.zip")
+    time.sleep(1.5)
+    download_file(url, dest, timeout=timeout)
+    with zipfile.ZipFile(dest) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise ValueError(f"No CSV inside {dest}")
+        with zf.open(csv_names[0]) as fh:
+            df = pd.read_csv(io.BytesIO(fh.read()), encoding="utf-8", low_memory=False)
+    return dest, df
+
+
+def fetch_bls_series(
+    series_ids: list[str],
+    start_year: int,
+    end_year: int,
+    annual: bool = True,
+    api_key: str | None = None,
+    timeout: int = 60,
+) -> pd.DataFrame:
+    """Fetch one or more BLS series via the public timeseries API (v2).
+
+    Used instead of the download.bls.gov flat files because that host returns a
+    403 Akamai block page to automated GETs (confirmed 2026-09-30, even with a
+    full browser header set). The public API is keyless for modest use (25
+    requests/day, up to 10 years per request); an optional registration key
+    (BLS_API_KEY in .env) raises the limits but is NOT required here.
+
+    Args:
+        series_ids: BLS series IDs, e.g. ["CUUR0000SA0"] (CPI-U All Items) or
+                    ["CUUR0000SEEB01"] (CPI-U college tuition & fees subindex).
+        start_year: First year (inclusive).
+        end_year:   Last year (inclusive).
+        annual:     Request annual averages (M13) in addition to monthly.
+        api_key:    Optional BLS registration key.
+        timeout:    Request timeout in seconds.
+
+    Returns:
+        Long-format DataFrame: series_id, year, period, period_name, value,
+        footnotes — the raw API payload rows, untouched.
+    """
+    url = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
+    payload: dict[str, Any] = {
+        "seriesid": series_ids,
+        "startyear": str(start_year),
+        "endyear": str(end_year),
+        "annualaverage": annual,
+    }
+    if api_key:
+        payload["registrationkey"] = api_key
+
+    time.sleep(1.5)
+    resp = requests.post(
+        url, json=payload, headers={"Content-Type": "application/json"}, timeout=timeout
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("status") != "REQUEST_SUCCEEDED":
+        raise RuntimeError(f"BLS API error: {body.get('status')} — {body.get('message')}")
+
+    records: list[dict[str, Any]] = []
+    for series in body["Results"]["series"]:
+        sid = series["seriesID"]
+        for row in series["data"]:
+            records.append(
+                {
+                    "series_id": sid,
+                    "year": row["year"],
+                    "period": row["period"],
+                    "period_name": row["periodName"],
+                    "value": row["value"],
+                    "footnotes": "; ".join(
+                        f.get("text", "") for f in row.get("footnotes", []) if f
+                    ),
+                }
+            )
+    return pd.DataFrame(records)

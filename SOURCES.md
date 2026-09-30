@@ -26,40 +26,44 @@ Copy and fill in for each source:
 
 ## Sources
 
-> The entries below are the **planned** primary sources for this project.
-> Confirm the exact per-year download URLs and file structures during
-> `01-ingest` before treating any of these as final, and fill in the
-> `Retrieved` date when each file actually lands in `data/raw/`.
+> The URLs and structure below were **confirmed live during `01-ingest` on
+> 2026-09-30**. Two IPEDS collection years (2011-12 and 2021-22) were pulled to
+> support the over-time story; `01-ingest.ipynb` narrates every download.
 
 ### IPEDS — Integrated Postsecondary Education Data System
 - **Publisher:** National Center for Education Statistics (NCES), U.S. Department of Education
-- **URL:** https://nces.ed.gov/ipeds/use-the-data — complete data files at https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx
-- **Format:** CSV / ZIP (per survey, per year)
+- **URL:** Complete data files at https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx — per-survey, per-year zipped CSVs at the stable pattern `https://nces.ed.gov/ipeds/datacenter/data/<SURVEY_FILE>.zip`
+- **Format:** ZIP of CSV (one per survey component, per collection year)
 - **License:** Public domain (U.S. federal government work)
-- **Fields used:** Institutional Characteristics (state, sector, level, Carnegie class); Charges (published tuition & fees); Finance/F survey (expenses by function — instruction, academic support, student services, institutional support, research); Enrollment (EF/EFFY, for per-FTE normalization)
-- **Coverage:** U.S. postsecondary institutions; ~1980–present depending on survey component
-- **Notes:** Finance survey splits into GASB (public) and FASB (private nonprofit/for-profit) files with different accounting standards — expense categories do NOT map 1:1 and must be harmonized or analyzed separately. Survey definitions have changed over the decades; watch for series breaks.
-- **Retrieved:** TODO
+- **Fields used / files pulled (2011-12 and 2021-22):**
+  - `HD<year>` — Institutional Characteristics header (state `STABBR`, sector, level, Carnegie class); keys other tables via `UNITID`
+  - `IC<year>_AY` — Charges: published tuition & required fees (sticker price), academic-year
+  - `F<yy><yy>_F1A` — Finance **GASB** (public institutions): expenses by function
+  - `F<yy><yy>_F2` — Finance **FASB** (private nonprofit): expenses by function
+  - `EFFY<year>` — 12-month unduplicated enrollment (for per-FTE normalization)
+- **Coverage:** U.S. postsecondary institutions; this ingest pulls collection years 2011-12 and 2021-22 (a full decade)
+- **Notes:** **The Finance survey splits into GASB (public, `*_F1A`) and FASB (private nonprofit, `*_F2`) files with different accounting standards — expense-function categories do NOT map 1:1 and are kept as separate raw tables (`ipeds_finance_gasb_*`, `ipeds_finance_fasb_*`); they must be harmonized before any admin-vs-classroom comparison.** IPEDS survey definitions have also shifted over the decade, so 2011-12 and 2021-22 are treated as separate series requiring harmonization. IPEDS CSVs read as `latin-1` (occasional non-UTF-8 bytes in text fields).
+- **Retrieved:** 2026-09-30
 
 ### College Scorecard
 - **Publisher:** U.S. Department of Education
-- **URL:** https://collegescorecard.ed.gov/data/
-- **Format:** CSV (bulk ZIP) + API
+- **URL:** Data page https://collegescorecard.ed.gov/data/ — bulk "Most Recent Institution-Level Data" ZIP at `https://ed-public-download.scorecard.network/downloads/Most-Recent-Cohorts-Institution_05192025.zip`
+- **Format:** CSV inside a bulk ZIP
 - **License:** Public domain (U.S. federal government work)
-- **Fields used:** Net price, average cost of attendance, completion rate, post-enrollment earnings, by institution and year
-- **Coverage:** U.S. Title IV institutions; ~1996–present (cost/net-price fields robust from ~2009)
-- **Notes:** Used for the modern cost-and-outcomes layer and to cross-validate IPEDS cost figures. Net price ≠ sticker price — report both explicitly.
-- **Retrieved:** TODO
+- **Fields used:** Net price (`NPT4_*`), cost of attendance (`COSTT4_*`), completion rate (`C150_*`), median post-enrollment earnings (`MD_EARN_*`), by institution
+- **Coverage:** U.S. Title IV institutions; most-recent cohort snapshot (cost/net-price fields robust from ~2009)
+- **Notes:** The historical bulk host `ed-public-download.app.cloud.gov/downloads/CollegeScorecard_Raw_Data.zip` now returns **404**; the current host `ed-public-download.scorecard.network` was resolved from the data.ed.gov CKAN package listing (`college-scorecard-all-data-files`). This ingest uses the single-CSV "Most Recent Institution-Level Data" file (latest cohort per institution), not the full multi-year raw archive (`College_Scorecard_Raw_Data_05192025.zip`, documented in config for later use). Net price ≠ sticker price — report both explicitly.
+- **Retrieved:** 2026-09-30
 
 ### BLS Consumer Price Index (CPI-U)
 - **Publisher:** U.S. Bureau of Labor Statistics
-- **URL:** https://download.bls.gov/pub/time.series/cu/
-- **Format:** Tab-separated flat files
+- **URL:** BLS public timeseries API `https://api.bls.gov/publicAPI/v2/timeseries/data/` (see Notes on the flat-file host)
+- **Format:** JSON (API) → saved as long-format CSV in `data/raw/cpi_u/`
 - **License:** Public domain (U.S. federal government work)
-- **Fields used:** CPI-U All Items (for real-dollar adjustment); optionally the college-tuition subindex (SEEB01) to compare tuition inflation vs general inflation
-- **Coverage:** U.S., monthly, 1913–present (All Items)
-- **Notes:** Nominal tuition growth is misleading; inflation-adjustment is required for the core "cost over time" story.
-- **Retrieved:** TODO
+- **Fields used:** `CUUR0000SA0` (CPI-U All Items, U.S. city average, NSA — real-dollar deflator); `CUUR0000SEEB01` (CPI-U college tuition & fees subindex, to compare tuition inflation vs general inflation). Pulled 2000–2024, monthly + M13 annual averages.
+- **Coverage:** U.S., monthly, 1913–present (All Items); this ingest pulls 2000–2024
+- **Notes:** **The flat-file host `https://download.bls.gov/pub/time.series/cu/` returns HTTP 403 (Akamai block page) to automated GETs — confirmed 2026-09-30 even with a full browser header set — so CPI-U is pulled from the BLS public API instead.** The API is keyless for modest use (25 requests/day, ≤10 years per request; the 2000–2024 span is fetched in two windows); an optional `BLS_API_KEY` in the gitignored `.env` raises the limits but is not required. CPI-U reference base is 1982-84=100; NSA (do not mix with seasonally adjusted). Nominal tuition growth is misleading; inflation adjustment is required for the "cost over time" story.
+- **Retrieved:** 2026-09-30
 
 #### Supplemental (validation / context)
 - **NCES Digest of Education Statistics** — pre-tabulated national/state summary tables (https://nces.ed.gov/programs/digest/) — for cross-checking IPEDS-derived numbers.
