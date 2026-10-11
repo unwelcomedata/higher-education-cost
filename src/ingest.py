@@ -357,6 +357,18 @@ def read_ipeds_zip(zip_path: Path) -> pd.DataFrame:
     sometimes a "_rv" revised-data variant. This reads the main (non-_rv) CSV.
     The raw ZIP on disk is the untouched artifact; this is just to load it for
     inspection / DuckDB registration.
+
+    index_col=False is REQUIRED: some IPEDS collection years ship data rows with
+    a trailing comma, so each row carries one more field than the header has
+    names (confirmed for IC2012_AY: 268 header names vs 269 fields/row — the
+    header's last name even has a trailing space, "CMP3GTD "). When fields >
+    header, pandas' default C parser silently promotes the first column to the
+    row index, shifting every labeled column one position to the left — which is
+    exactly how IC2012 parsed to UNITID="R" / XTUIT1=<tuition> / TUITION1="R"
+    (the "R" imputation flags landing in the data columns and vice versa).
+    Forcing index_col=False keeps column 0 (UNITID) as data and drops the
+    unnamed trailing empty field. The 2022 file has no trailing comma, so this
+    is a no-op for it — the fix repairs 2012 without regressing 2022.
     """
     with zipfile.ZipFile(zip_path) as zf:
         csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
@@ -366,7 +378,13 @@ def read_ipeds_zip(zip_path: Path) -> pd.DataFrame:
         primary = sorted(csv_names, key=lambda n: ("_rv" in n.lower(), len(n)))[0]
         with zf.open(primary) as fh:
             # latin-1: IPEDS CSVs occasionally carry non-UTF-8 bytes in text fields.
-            df = pd.read_csv(io.BytesIO(fh.read()), encoding="latin-1", low_memory=False)
+            # index_col=False: guard against trailing-comma rows (see docstring).
+            df = pd.read_csv(
+                io.BytesIO(fh.read()),
+                encoding="latin-1",
+                low_memory=False,
+                index_col=False,
+            )
     return df
 
 

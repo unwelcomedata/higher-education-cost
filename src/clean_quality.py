@@ -294,3 +294,275 @@ def save_processed(df: pd.DataFrame, cfg: dict[str, Any], filename: str) -> Path
     df.to_parquet(out, index=False, engine=cfg["settings"]["parquet_engine"])
     print(f"Saved processed → {out}  ({len(df):,} rows)")
     return out
+
+
+# ===========================================================================
+# Project-specific harmonization helpers — higher-education-cost (02-clean)
+# ===========================================================================
+#
+# Everything below is DuckDB-SQL based (no pandas chained transforms). They
+# turn the 12 _raw tables (+ re-ingested EFIA FTE + re-pulled CPI) into the
+# harmonized, quality-checked interim `_clean` tables described in
+# artifacts/HARMONIZATION-DESIGN.md §8.1.
+#
+# ⭐ GASB/FASB function crosswalk — DICTIONARY-CONFIRMED (design §1.2 "the
+# dictionary wins"). The IPEDS F1A/F2 data dictionaries (2012 & 2022) were read
+# directly (varlist sheet). The design draft mapped GASB to F1E01–F1E07, which
+# the dictionary shows are the SCHOLARSHIPS/GRANTS block, NOT expenses by
+# function. The real GASB expenses-by-function block is **F1C**, and its
+# function index differs from FASB's. The confirmed mapping:
+#
+#   function                 GASB (F1C)   FASB (F2E)   dict varTitle (both agree)
+#   instruction              F1C011       F2E011       "Instruction"
+#   research                 F1C021       F2E021       "Research"
+#   public_service           F1C031       F2E031       "Public service"
+#   academic_support         F1C051       F2E041       "Academic support"
+#   student_services         F1C061       F2E051       "Student service(s)"
+#   institutional_support    F1C071       F2E061       "Institutional support"  (= admin)
+#   total_expenses           F1C191       F2E131       "Total expenses ..."     (sidecar only)
+#
+# The five charted/comparable-core functions are instruction, research,
+# student_services, institutional_support, plus academic_support. (The design
+# flagged academic_support as GASB-sparse, but that was based on the WRONG
+# column F1E04; the correct F1C051 is well-populated in both sectors — the
+# per-sector coverage printed by quality_report() documents this.)
+
+# Harmonized function  ->  (GASB F1C total column, FASB F2E total column)
+FUNCTION_CROSSWALK: dict[str, tuple[str, str]] = {
+    "instruction":           ("F1C011", "F2E011"),
+    "research":              ("F1C021", "F2E021"),
+    "public_service":        ("F1C031", "F2E031"),
+    "academic_support":      ("F1C051", "F2E041"),
+    "student_services":      ("F1C061", "F2E051"),
+    "institutional_support": ("F1C071", "F2E061"),
+}
+# Per-standard grand-total columns (sidecar reconciliation only — never charted,
+# never a share denominator). GASB F1C191 / FASB F2E131 (NOT F2E071).
+FINANCE_TOTAL_COLS: dict[str, str] = {"gasb": "F1C191", "fasb": "F2E131"}
+
+
+def confirm_finance_dictionary(
+    con: duckdb.DuckDBPyConnection,
+    dict_zip_paths: dict[str, Path],
+) -> pd.DataFrame:
+    """§1.2 hard precondition — dictionary-confirm every used finance function code.
+
+    Reads the IPEDS F1A/F2 data-dictionary ``varlist`` sheet (shipped as an .xlsx
+    inside each ``<FILE>_Dict.zip``) and returns the official ``varTitle`` for every
+    GASB F1C / FASB F2E code the crosswalk uses, for whichever years are supplied.
+    The caller asserts the titles agree with FUNCTION_CROSSWALK before building the
+    finance spine; if they disagree the dictionary wins and the crosswalk is fixed.
+
+    Args:
+        con:            Open DuckDB connection (unused for reads here; kept for a
+                        uniform helper signature / future table-backed checks).
+        dict_zip_paths: Map of a label (e.g. "gasb_2022") -> Path to that survey's
+                        ``_Dict.zip``.
+
+    Returns:
+        Long DataFrame: label, standard, year, varname, varTitle — one row per
+        confirmed code per supplied dictionary.
+    """
+    import io
+    import zipfile
+
+    gasb_codes = {g for g, _ in FUNCTION_CROSSWALK.values()} | {FINANCE_TOTAL_COLS["gasb"]}
+    fasb_codes = {f for _, f in FUNCTION_CROSSWALK.values()} | {FINANCE_TOTAL_COLS["fasb"]}
+
+    rows: list[dict[str, Any]] = []
+    for label, zp in dict_zip_paths.items():
+        standard = "gasb" if "gasb" in label else "fasb"
+        year = "".join(ch for ch in label if ch.isdigit())
+        wanted = gasb_codes if standard == "gasb" else fasb_codes
+        with zipfile.ZipFile(zp) as zf:
+            xlsx = [n for n in zf.namelist() if n.lower().endswith(".xlsx")][0]
+            vl = pd.ExcelFile(io.BytesIO(zf.read(xlsx))).parse("varlist")
+        for _, r in vl.iterrows():
+            vn = str(r["varname"]).strip().upper()
+            if vn in wanted:
+                rows.append(
+                    {
+                        "label": label,
+                        "standard": standard,
+                        "year": year,
+                        "varname": vn,
+                        "varTitle": str(r["varTitle"]).strip(),
+                    }
+                )
+    return pd.DataFrame(rows).sort_values(["label", "varname"]).reset_index(drop=True)
+
+
+def assert_finance_columns_present(con: duckdb.DuckDBPyConnection) -> None:
+    """Assert every used finance function + total column exists in all four finance tables.
+
+    Raises AssertionError naming any missing code (design §1.2 note 4 / §10).
+    """
+    gasb_codes = [g for g, _ in FUNCTION_CROSSWALK.values()] + [FINANCE_TOTAL_COLS["gasb"]]
+    fasb_codes = [f for _, f in FUNCTION_CROSSWALK.values()] + [FINANCE_TOTAL_COLS["fasb"]]
+    checks = {
+        "ipeds_finance_gasb_2012_raw": gasb_codes,
+        "ipeds_finance_gasb_2022_raw": gasb_codes,
+        "ipeds_finance_fasb_2012_raw": fasb_codes,
+        "ipeds_finance_fasb_2022_raw": fasb_codes,
+    }
+    for table, codes in checks.items():
+        have = {c.upper() for c in con.execute(f"SELECT * FROM {table} LIMIT 0").df().columns}
+        missing = [c for c in codes if c not in have]
+        assert not missing, f"{table} missing finance columns: {missing}"
+
+
+def build_hd_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """hd_clean — institution directory, one row per UNITID × year (stacked 2012+2022)."""
+    sql = """
+    WITH stacked AS (
+        SELECT UNITID AS unitid, 2012 AS year, INSTNM AS instnm, STABBR AS stabbr,
+               SECTOR AS sector, CONTROL AS control, ICLEVEL AS iclevel
+        FROM ipeds_hd_2012_raw
+        UNION ALL
+        SELECT UNITID, 2022, INSTNM, STABBR, SECTOR, CONTROL, ICLEVEL
+        FROM ipeds_hd_2022_raw
+    )
+    SELECT unitid, year, TRIM(instnm) AS instnm, TRIM(stabbr) AS stabbr,
+           TRY_CAST(sector AS INTEGER) AS sector,
+           TRY_CAST(control AS INTEGER) AS control,
+           TRY_CAST(iclevel AS INTEGER) AS iclevel
+    FROM stacked
+    """
+    return run_sql(sql, con)
+
+
+def _finance_melt_sql(standard: str, table: str, year: int, control_label: str) -> str:
+    """Return a UNION-ALL SELECT that melts one finance table into the long function schema.
+
+    Reads ONLY the numeric F1C*/F2E* function totals (never an X* imputation flag).
+    """
+    idx = 0 if standard == "gasb" else 1
+    parts = []
+    for function, cols in FUNCTION_CROSSWALK.items():
+        col = cols[idx]
+        parts.append(
+            f"SELECT UNITID AS unitid, {year} AS year, '{control_label}' AS control, "
+            f"'{function}' AS function, TRY_CAST({col} AS DOUBLE) AS amount, "
+            f"'{col}' AS source_col FROM {table}"
+        )
+    return "\nUNION ALL\n".join(parts)
+
+
+def build_finance_functions_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """finance_functions_clean — the harmonized long spine.
+
+    One row per UNITID × year × function, each tagged control (public = GASB rows,
+    private_np = FASB rows) with nominal `amount` and the `source_col` it came from.
+    Built from the dictionary-confirmed F1C (GASB) / F2E (FASB) crosswalk, all in
+    DuckDB SQL (design §1.2 / §8.1).
+    """
+    blocks = [
+        _finance_melt_sql("gasb", "ipeds_finance_gasb_2012_raw", 2012, "public"),
+        _finance_melt_sql("gasb", "ipeds_finance_gasb_2022_raw", 2022, "public"),
+        _finance_melt_sql("fasb", "ipeds_finance_fasb_2012_raw", 2012, "private_np"),
+        _finance_melt_sql("fasb", "ipeds_finance_fasb_2022_raw", 2022, "private_np"),
+    ]
+    sql = "\nUNION ALL\n".join(blocks)
+    return run_sql(sql, con)
+
+
+def build_finance_totals_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """finance_totals_clean — sidecar per-standard grand totals for §10 reconciliation only.
+
+    One row per UNITID × year × control with `raw_total` = GASB F1C191 / FASB F2E131.
+    Never charted, never a share denominator (design §1.2 note 3).
+    """
+    g_tot = FINANCE_TOTAL_COLS["gasb"]
+    f_tot = FINANCE_TOTAL_COLS["fasb"]
+    sql = f"""
+    SELECT UNITID AS unitid, 2012 AS year, 'public' AS control,
+           TRY_CAST({g_tot} AS DOUBLE) AS raw_total FROM ipeds_finance_gasb_2012_raw
+    UNION ALL
+    SELECT UNITID, 2022, 'public', TRY_CAST({g_tot} AS DOUBLE) FROM ipeds_finance_gasb_2022_raw
+    UNION ALL
+    SELECT UNITID, 2012, 'private_np', TRY_CAST({f_tot} AS DOUBLE) FROM ipeds_finance_fasb_2012_raw
+    UNION ALL
+    SELECT UNITID, 2022, 'private_np', TRY_CAST({f_tot} AS DOUBLE) FROM ipeds_finance_fasb_2022_raw
+    """
+    return run_sql(sql, con)
+
+
+def build_fte_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """fte_clean — one row per UNITID × year: fte_total from the re-ingested EFIA file.
+
+    fte_total = reported undergrad FTE (FTEUG) + reported grad FTE (FTEGD), each
+    coalesced to 0 (FTEGD is null for institutions with no graduate programs).
+    EFIA is the authoritative IPEDS 12-month FTE (design §4) — one row per UNITID.
+    Requires ipeds_fte_2012_raw / ipeds_fte_2022_raw (blocker B1).
+    """
+    sql = """
+    SELECT UNITID AS unitid, 2012 AS year,
+           COALESCE(TRY_CAST(FTEUG AS DOUBLE), 0) + COALESCE(TRY_CAST(FTEGD AS DOUBLE), 0) AS fte_total
+    FROM ipeds_fte_2012_raw
+    UNION ALL
+    SELECT UNITID, 2022,
+           COALESCE(TRY_CAST(FTEUG AS DOUBLE), 0) + COALESCE(TRY_CAST(FTEGD AS DOUBLE), 0)
+    FROM ipeds_fte_2022_raw
+    """
+    return run_sql(sql, con)
+
+
+def build_charges_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """charges_clean — sticker price, one row per UNITID × year, three residency tiers.
+
+    IC_AY dictionary-confirmed mapping (design §7): TUITION1 = in-district,
+    TUITION2 = in-state, TUITION3 = out-of-state, with matching FEE1/2/3.
+    Sticker price only — kept DISTINCT from Scorecard net price (§7).
+    """
+    sql = """
+    SELECT UNITID AS unitid, 2012 AS year,
+           TRY_CAST(TUITION1 AS DOUBLE) AS tuition_in_district,
+           TRY_CAST(FEE1 AS DOUBLE)     AS fee_in_district,
+           TRY_CAST(TUITION2 AS DOUBLE) AS tuition_in_state,
+           TRY_CAST(FEE2 AS DOUBLE)     AS fee_in_state,
+           TRY_CAST(TUITION3 AS DOUBLE) AS tuition_out_state,
+           TRY_CAST(FEE3 AS DOUBLE)     AS fee_out_state
+    FROM ipeds_charges_2012_raw
+    UNION ALL
+    SELECT UNITID, 2022,
+           TRY_CAST(TUITION1 AS DOUBLE), TRY_CAST(FEE1 AS DOUBLE),
+           TRY_CAST(TUITION2 AS DOUBLE), TRY_CAST(FEE2 AS DOUBLE),
+           TRY_CAST(TUITION3 AS DOUBLE), TRY_CAST(FEE3 AS DOUBLE)
+    FROM ipeds_charges_2022_raw
+    """
+    return run_sql(sql, con)
+
+
+def build_net_price_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """net_price_clean — Scorecard net price, one row per UNITID (snapshot, no year).
+
+    net_price_pub (NPT4_PUB) / net_price_priv (NPT4_PRIV) / cost_attendance (COSTT4_A).
+    Net price != sticker price — kept in a separate table (design §7).
+    """
+    sql = """
+    SELECT TRY_CAST(UNITID AS BIGINT) AS unitid,
+           TRY_CAST(NPT4_PUB AS DOUBLE)  AS net_price_pub,
+           TRY_CAST(NPT4_PRIV AS DOUBLE) AS net_price_priv,
+           TRY_CAST(COSTT4_A AS DOUBLE)  AS cost_attendance
+    FROM scorecard_raw
+    """
+    return run_sql(sql, con)
+
+
+def build_cpi_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """cpi_clean — one row per year: cpi_all_items + cpi_tuition_subindex, M13 annual avg.
+
+    year/value are VARCHAR in cpi_u_raw → TRY_CAST before any filter (design §5).
+    All-Items = CUUR0000SA0 (deflator); tuition subindex = CUUR0000SEEB01 (comparison
+    only, never a deflator). Requires cpi_u_raw to reach ≥2022 (blocker B2).
+    """
+    sql = """
+    SELECT TRY_CAST(year AS INTEGER) AS year,
+           MAX(CASE WHEN series_id = 'CUUR0000SA0'    THEN TRY_CAST(value AS DOUBLE) END) AS cpi_all_items,
+           MAX(CASE WHEN series_id = 'CUUR0000SEEB01' THEN TRY_CAST(value AS DOUBLE) END) AS cpi_tuition_subindex
+    FROM cpi_u_raw
+    WHERE period = 'M13'
+    GROUP BY TRY_CAST(year AS INTEGER)
+    ORDER BY year
+    """
+    return run_sql(sql, con)

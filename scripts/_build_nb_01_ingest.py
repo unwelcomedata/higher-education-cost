@@ -73,6 +73,7 @@ from src.ingest import (
     read_ipeds_zip,
     ingest_scorecard,
     fetch_bls_series,
+    raw_path,
 )
 from src.clean_quality import get_connection, load_to_duckdb, register_source, get_sources
 
@@ -152,6 +153,74 @@ for survey_file, table in IPEDS_TABLES.items():
     load_to_duckdb(df, table, con)                       # raw table, no transform
     ipeds_shapes[table] = df.shape
     print(f"{survey_file:>10}  ->  {table:<32}  rows={df.shape[0]:>7,}  cols={df.shape[1]}")
+"""
+)
+
+md(
+    r"""
+### ⚠️ Fix — IC2012_AY parsed one column off (all-"R" UNITID / tuition)
+
+**The bug (found during the 03-prepare / 04-viz build):** in the first ingest,
+`ipeds_charges_2012_raw` came out with **every `UNITID` and every tuition value
+as the literal string `"R"`**, so 2012 sticker tuition was unusable (and so was
+`charges_clean` for year 2012). The 2022 charges table (`ipeds_charges_2022_raw`)
+was fine. The core admin-vs-classroom finance story never depended on this file;
+this fix is purely to restore the 2012 tuition dollars for a 2012→2022 sticker-
+tuition trend.
+
+**Root cause — a trailing comma + a header/row column-count mismatch, NOT a
+wrong file.** The base `IC2012_AY.zip` and its single CSV `ic2012_ay.csv` are the
+correct files (no `_rv` revised variant was needed). The problem is in the file's
+shape:
+
+- `ic2012_ay.csv` **header has 268 column names** (its last name even carries a
+  trailing space, `"CMP3GTD "`), but **every data row has 269 fields** — the rows
+  end in a trailing comma, producing one extra, unnamed, empty field.
+- When fields > header names, pandas' default C parser **silently promotes the
+  first column to the row index**, shifting every labeled column one position to
+  the left. So `UNITID` received `XTUIT1`'s value (the `"R"` imputation flag),
+  `XTUIT1` received the real tuition, `TUITION1` received the next `"R"` flag, and
+  so on down the row — exactly the all-`"R"` symptom.
+- IPEDS interleaves imputation-flag columns (`X`-prefixed, holding `R`/`A`/`Y`)
+  with the data columns, which is why the shifted values were all `"R"`.
+
+**Why 2012 broke but 2022 didn't:** `ic2022_ay.csv` has **235 header names and
+235 fields per row** — no trailing comma, no mismatch — so it parsed with correct
+alignment. Only the 2012 file ships the trailing comma.
+
+**The fix:** `read_ipeds_zip()` now reads with **`index_col=False`**, which forces
+pandas to keep column 0 (`UNITID`) as data and drop the unnamed trailing empty
+field. This repairs 2012 and is a no-op for 2022 (verified below). The raw ZIP on
+disk is untouched — the trailing comma is still there verbatim; we just parse it
+correctly.
+
+The cell below **re-ingests `IC2012_AY` through the fixed `read_ipeds_zip()`**
+and overwrites `ipeds_charges_2012_raw` with correctly-aligned data.
+"""
+)
+
+code(
+    r"""
+# Re-ingest the IC2012 charges file through the fixed read_ipeds_zip (index_col=False).
+# The raw ZIP already on disk is reused verbatim (no re-download needed); we only
+# re-parse and overwrite the malformed raw table.
+ic2012_zip = raw_path(cfg, "ipeds/IC2012_AY.zip")
+df_ic2012 = read_ipeds_zip(ic2012_zip)
+load_to_duckdb(df_ic2012, "ipeds_charges_2012_raw", con)
+
+# Confirm the shift is gone: UNITID is now a real integer and TUITION1 a dollar value.
+print("ipeds_charges_2012_raw re-parsed shape:", df_ic2012.shape)
+print("Representative fixed rows (UNITID / XTUIT1 flag / TUITION1 dollars):")
+print(
+    con.execute(
+        "SELECT UNITID, XTUIT1, TUITION1, XFEE1, FEE1 FROM ipeds_charges_2012_raw LIMIT 5"
+    ).df().to_string(index=False)
+)
+n2012 = con.execute("SELECT COUNT(*) FROM ipeds_charges_2012_raw").fetchone()[0]
+n_bad = con.execute(
+    "SELECT COUNT(*) FROM ipeds_charges_2012_raw WHERE TRY_CAST(UNITID AS BIGINT) IS NULL"
+).fetchone()[0]
+print(f"\nrows = {n2012:,}   non-numeric UNITIDs remaining = {n_bad}  (expect 0)")
 """
 )
 

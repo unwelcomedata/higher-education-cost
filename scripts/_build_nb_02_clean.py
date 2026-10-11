@@ -1,0 +1,704 @@
+"""Build notebooks/02-clean.ipynb for higher-education-cost via nbformat.
+
+Run from the project root with the project venv:
+    .venv/bin/python scripts/_build_nb_02_clean.py
+
+Produces the canonical-record cleaning notebook: a markdown cell per step
+(narrating WHAT + WHY at its pipeline stage) followed by a code cell that calls
+the src/clean_quality.py helper. ALL cleaning happens inside DuckDB. The
+notebook is executed headless with:
+    .venv/bin/python -m nbconvert --to notebook --execute --inplace notebooks/02-clean.ipynb
+
+Structure/style copied from scripts/_build_nb_01_ingest.py.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import nbformat as nbf
+
+nb = nbf.v4.new_notebook()
+cells: list = []
+
+
+def md(text: str) -> None:
+    cells.append(nbf.v4.new_markdown_cell(text.strip("\n")))
+
+
+def code(text: str) -> None:
+    cells.append(nbf.v4.new_code_cell(text.strip("\n")))
+
+
+# ---------------------------------------------------------------------------
+md(
+    """
+# 02 — Clean · higher-education-cost
+
+**Goal of this stage:** turn the 12 raw IPEDS/Scorecard/CPI tables (plus two
+re-ingested sources) into **harmonized, quality-checked interim `_clean`
+tables**, saved as Parquet to `data/interim/` and created as `_clean` DuckDB
+tables. **ALL cleaning happens inside DuckDB** (via `run_sql` / `clean_table`),
+never with pandas chained transforms — per workspace norms.
+
+The one load-bearing methodology decision — reconciling IPEDS Finance **GASB
+(public)** vs **FASB (private nonprofit)** expenses-by-function into a comparable
+*admin-vs-classroom* schema — is settled in
+`artifacts/HARMONIZATION-DESIGN.md`. This notebook implements it.
+
+**What gets built (design §8.1):**
+
+| Interim `_clean` table | Grain | What it is |
+|---|---|---|
+| `hd_clean` | UNITID × year | Institution directory (state, sector, control, level) |
+| `finance_functions_clean` | UNITID × year × function | **The harmonized spine** — GASB+FASB melted onto one 6-function schema, each row tagged `control` |
+| `finance_totals_clean` | UNITID × year × control | Sidecar per-standard grand totals (reconciliation only) |
+| `fte_clean` | UNITID × year | 12-month FTE from the re-ingested EFIA file |
+| `charges_clean` | UNITID × year | Sticker tuition & fees, three residency tiers |
+| `net_price_clean` | UNITID (snapshot) | Scorecard net price — kept DISTINCT from sticker |
+| `cpi_clean` | year | CPI-U All-Items + tuition subindex, annual averages |
+
+**⭐ Series-break caveats carried forward** (into `_sources` + `SOURCES.md`):
+GASB isolates operation-and-maintenance of plant as its own function while FASB
+distributes it into the other functions, so the harmonized functions are
+comparable only to within that allocation difference; raw totals are
+standard-specific and never compared across standards; IPEDS survey definitions
+shifted 2011-12 → 2021-22 (treated as two series, not a continuous panel);
+institutions enter/exit between the two years.
+"""
+)
+
+code(
+    """
+import os
+import sys
+from pathlib import Path
+
+# Resolve the project root (folder containing config.yaml) and make src importable.
+PROJECT = Path.cwd()
+while not (PROJECT / "config.yaml").exists() and PROJECT != PROJECT.parent:
+    PROJECT = PROJECT.parent
+os.chdir(PROJECT)
+sys.path.insert(0, str(PROJECT))
+
+import pandas as pd
+
+from src.ingest import (
+    load_config,
+    download_ipeds_survey,
+    read_ipeds_zip,
+    fetch_bls_series,
+    download_file,
+    raw_path,
+)
+from src import clean_quality as cq
+
+cfg = load_config("config.yaml")
+con = cq.get_connection(cfg)   # opens data/project.duckdb (single-writer!)
+RETRIEVED = "2026-09-30"
+print("Project:", cfg["project_name"])
+print("DuckDB :", cfg["settings"]["duckdb_file"])
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Blocker B1 (re-ingest) — IPEDS 12-month FTE (`EFIA`)
+
+The already-loaded EFFY enrollment file carries **headcount with no FTE and no
+full-time/part-time split** (design §4), so there is **no viable FTE
+approximation** from it. The per-FTE metric needs IPEDS's own authoritative
+**12-month FTE**, which lives in the derived **`EFIA`** survey file — not
+previously ingested.
+
+A new/expanded source is **ingestion**, so per the workspace stage-gate this
+re-enters at `01-ingest`. It is placed here (a clearly-labeled re-ingest
+section) rather than mutating the committed, APPROVED `01-ingest` notebook; it
+uses the same `src/ingest.py` helpers and registers `_sources`.
+
+**Source:** IPEDS `EFIA2022` / `EFIA2012` (NCES), public domain, no auth.
+`https://nces.ed.gov/ipeds/datacenter/data/EFIA<year>.zip`. The authoritative
+columns are **`FTEUG`** (reported 12-month undergraduate FTE) and **`FTEGD`**
+(reported 12-month graduate FTE); one row per institution. We compute
+`fte_total = FTEUG + FTEGD` in `fte_clean` below.
+"""
+)
+
+code(
+    r"""
+EFIA_TABLES = {"EFIA2012": "ipeds_fte_2012_raw", "EFIA2022": "ipeds_fte_2022_raw"}
+
+for survey_file, table in EFIA_TABLES.items():
+    zip_path = download_ipeds_survey(survey_file, cfg)   # verbatim -> data/raw/ipeds/
+    df = read_ipeds_zip(zip_path)
+    df.columns = [c.strip() for c in df.columns]         # IPEDS pads a trailing col name
+    cq.load_to_duckdb(df, table, con)
+    fte_cols = [c for c in df.columns if "FTE" in c.upper()]
+    print(f"{survey_file:>9}  ->  {table:<22}  rows={df.shape[0]:>6,}  FTE cols={fte_cols[:4]}")
+
+    cq.register_source(
+        con, table=table, name=f"IPEDS {survey_file} (NCES)",
+        url=f"https://nces.ed.gov/ipeds/datacenter/data/{survey_file}.zip",
+        license="Public domain (U.S. federal government work)",
+        notes=("IPEDS 12-month instructional activity / FTE enrollment. FTEUG = reported "
+               "undergraduate FTE, FTEGD = reported graduate FTE; one row per UNITID. "
+               "Re-ingested in 02-clean because EFFY carries only headcount (no FTE)."),
+        retrieved=RETRIEVED,
+        methodology="IPEDS derived 12-month FTE (credit/clock-hour based); authoritative FTE for per-FTE normalization.",
+        series_breaks="IPEDS survey definitions shifted 2011-12 vs 2021-22; treat the two years as separate series.",
+    )
+
+# Verify: FTE tables exist, non-empty, with the FTE column present.
+for table in EFIA_TABLES.values():
+    cols = {c.upper() for c in con.execute(f"SELECT * FROM {table} LIMIT 0").df().columns}
+    n = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    assert n > 0 and "FTEUG" in cols, f"{table} missing/empty or no FTEUG column"
+print("B1 OK — EFIA FTE tables ingested with FTEUG present.")
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Blocker B2 (re-ingest) — BLS CPI-U through ≥2022
+
+`cpi_u_raw` as first ingested stopped at **2019** (the keyless BLS API returns
+≤10 years/request and the earlier two-window pull truncated). Without a **CY2022
+annual-average (`M13`) All-Items** value, the 2021-22 dollars **cannot be
+deflated** (design §5). We re-pull `CUUR0000SA0` (All Items) and
+`CUUR0000SEEB01` (college-tuition subindex) across **three ≤10-year windows**
+(2000–2009 / 2010–2019 / 2020–2024) so the series reaches 2024, and overwrite
+`cpi_u_raw`.
+
+Same stage-gate note as B1: this is ingestion, done here as a labeled re-ingest
+section using the existing `src/ingest.py::fetch_bls_series`, and `_sources` is
+re-registered. `BLS_API_KEY` (gitignored `.env`) is optional.
+"""
+)
+
+code(
+    r"""
+cpi_cfg = cfg["sources"]["cpi_u"]
+series_ids = list(cpi_cfg["series"].keys())
+api_key = os.environ.get("BLS_API_KEY")   # optional
+
+frames = []
+for (sy, ey) in [(2000, 2009), (2010, 2019), (2020, 2024)]:
+    frames.append(fetch_bls_series(series_ids, sy, ey, annual=True, api_key=api_key))
+df_cpi = pd.concat(frames, ignore_index=True)
+
+# Overwrite the raw artifact on disk + the raw table (this IS the BLS raw artifact).
+cpi_dest = raw_path(cfg, "cpi_u/cpi_u_raw.csv")
+df_cpi.to_csv(cpi_dest, index=False)
+cq.load_to_duckdb(df_cpi, "cpi_u_raw", con)
+
+yr_min, yr_max = con.execute("SELECT MIN(TRY_CAST(year AS INT)), MAX(TRY_CAST(year AS INT)) FROM cpi_u_raw").fetchone()
+m13_count = con.execute(
+    "SELECT COUNT(*) FROM cpi_u_raw WHERE series_id='CUUR0000SA0' AND period='M13' "
+    "AND year IN ('2012','2022')"
+).fetchone()[0]
+print(f"cpi_u_raw: rows={len(df_cpi):,}  year range {yr_min}-{yr_max}  "
+      f"All-Items M13 rows for 2012 & 2022 = {m13_count}")
+assert m13_count == 2, "CPI re-pull did not land M13 annual averages for both 2012 and 2022"
+
+cq.register_source(
+    con, table="cpi_u_raw", name="BLS CPI-U (All Items + college tuition subindex)",
+    url=cpi_cfg["api_url"], license="Public domain (U.S. federal government work)",
+    notes=("BLS CPI for All Urban Consumers. CUUR0000SA0 (All Items, NSA) = real-dollar deflator; "
+           "CUUR0000SEEB01 (college tuition & fees subindex) = tuition-vs-general-inflation comparison "
+           "ONLY (never used to deflate spending). Long format with M13 annual averages, 2000-2024."),
+    retrieved=RETRIEVED,
+    methodology="BLS public timeseries API v2 (keyless), three <=10-year windows to reach 2024.",
+    series_breaks="CPI-U base 1982-84=100, NSA. Used only as a ratio, so the base is irrelevant to deflation.",
+)
+print("B2 OK — CPI-U re-pulled through", yr_max)
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 2 — ⭐ Hard precondition: dictionary-confirm every finance function code
+
+Column *values* were read from the DB during design, but column *meanings* were
+not — and a naive "standard order" assumption is unsafe. Before building the
+finance spine we confirm each used code's official `varTitle` against the
+**IPEDS F1A / F2 data dictionaries** (the `varlist` sheet shipped as an `.xlsx`
+inside each survey's `<FILE>_Dict.zip`), for **both** collection years.
+
+> **⭐ The dictionary CORRECTED the design draft.** The draft crosswalk mapped
+> GASB expenses-by-function to columns `F1E01…F1E07`. The F1A dictionary shows
+> those are the **scholarships / grants** block (Pell grants, state grants, …),
+> **not** expenses by function. The real GASB expenses-by-function block is
+> **`F1C`**, and its function index differs from FASB's. The design's §1.2 rule
+> is explicit — *"if any `varTitle` disagrees with the table, the dictionary
+> wins and the crosswalk is corrected before building"* — so the implemented
+> crosswalk (in `src/clean_quality.py::FUNCTION_CROSSWALK`) uses the
+> dictionary-confirmed columns:
+>
+> | function | GASB (F1C) | FASB (F2E) |
+> |---|---|---|
+> | instruction | `F1C011` | `F2E011` |
+> | research | `F1C021` | `F2E021` |
+> | public_service | `F1C031` | `F2E031` |
+> | academic_support | `F1C051` | `F2E041` |
+> | student_services | `F1C061` | `F2E051` |
+> | institutional_support (**= admin**) | `F1C071` | `F2E061` |
+> | total_expenses (sidecar) | `F1C191` | `F2E131` |
+>
+> **Consequence:** the design flagged GASB `academic_support` as "sparse"
+> (236/2,004) and excluded it from cross-sector charts — but that was the WRONG
+> column (`F1E04` = local-government grants). The correct `F1C051` is
+> well-populated in both sectors (coverage printed by `quality_report` below), so
+> that sparsity rationale is defunct. `02-clean` carries `academic_support` in
+> the spine and reports its true coverage; whether to use it in public-vs-private
+> charts is a `03-prepare` decision, flagged there.
+"""
+)
+
+code(
+    r"""
+# Download the four finance data-dictionary ZIPs (varlist sheet) and confirm titles.
+DICT_FILES = {
+    "gasb_2012": "F1112_F1A", "gasb_2022": "F2122_F1A",
+    "fasb_2012": "F1112_F2",  "fasb_2022": "F2122_F2",
+}
+dict_zip_paths = {}
+for label, stem in DICT_FILES.items():
+    dest = raw_path(cfg, f"ipeds/{stem}_Dict.zip")
+    if not dest.exists():
+        download_file(f"https://nces.ed.gov/ipeds/datacenter/data/{stem}_Dict.zip", dest)
+    dict_zip_paths[label] = dest
+
+confirmed = cq.confirm_finance_dictionary(con, dict_zip_paths)
+print("Confirmed varTitles for every used finance code (both years):")
+print(confirmed.to_string(index=False))
+"""
+)
+
+code(
+    r"""
+# Assert the dictionary agrees with the implemented crosswalk (keyword match on varTitle),
+# and that every used column is present in all four finance tables.
+EXPECTED_TITLE_KEYWORD = {
+    "F1C011": "instruction", "F2E011": "instruction",
+    "F1C021": "research",    "F2E021": "research",
+    "F1C031": "public service", "F2E031": "public service",
+    "F1C051": "academic support", "F2E041": "academic support",
+    "F1C061": "student service",  "F2E051": "student service",
+    "F1C071": "institutional support", "F2E061": "institutional support",
+    "F1C191": "total expenses", "F2E131": "total expenses",
+}
+for _, r in confirmed.iterrows():
+    kw = EXPECTED_TITLE_KEYWORD[r["varname"]]
+    assert kw.lower() in r["varTitle"].lower(), (
+        f"Dictionary disagrees for {r['varname']} ({r['label']}): "
+        f"title={r['varTitle']!r} does not contain {kw!r}"
+    )
+cq.assert_finance_columns_present(con)
+print("✓ Dictionary confirms the crosswalk; all finance function + total columns present in all 4 tables.")
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 3 — `hd_clean` (institution directory)
+
+One row per `UNITID × year`, stacked from the 2012 + 2022 HD files via
+`UNION ALL` with a literal `year`. Carries `instnm, stabbr, sector, control,
+iclevel` — the state/sector dimensions every downstream join and chart needs.
+HD `control` (1=public, 2=private-nonprofit, 3=private for-profit) also lets
+`03-prepare` verify GASB rows are public and FASB rows are private-nonprofit.
+"""
+)
+
+code(
+    r"""
+hd = cq.build_hd_clean(con)
+cq.quality_report(hd, "hd_clean", con, required_columns=["unitid", "year", "stabbr", "control"])
+cq.load_to_duckdb(hd, "hd_clean", con)
+cq.save_interim(hd, cfg, "hd_clean.parquet")
+print("Rows per year:", hd.groupby("year").size().to_dict())
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 4 — `finance_functions_clean` (the harmonized long spine)
+
+The heart of the project. GASB (`F1C*`) and FASB (`F2E*`) expenses-by-function
+are **melted into one shared 6-function schema** — `instruction, research,
+public_service, academic_support, student_services, institutional_support` —
+with every row tagged `control` (`public` for GASB, `private_np` for FASB) and
+carrying the nominal `amount` plus the `source_col` it came from. All in DuckDB
+SQL (a `UNION ALL` of per-standard `SELECT`s), reading **only** the numeric
+`F1C*`/`F2E*` totals — never an `X*` imputation flag.
+
+A sidecar **`finance_totals_clean`** keeps each standard's own grand total
+(GASB `F1C191` / FASB `F2E131`, **not** `F2E071`) for the §10 reconciliation
+check only — it is never charted and never used as a share denominator (the
+single share denominator, built in `03-prepare`, is the in-pipeline sum of the
+harmonized function totals; design §1.2 note 3).
+
+**Caveat (carried forward):** GASB isolates operation-and-maintenance of plant
+as its own function; FASB distributes it into the other functions. So the
+harmonized functions are comparable only to within that O&M-allocation
+difference, and O&M is deliberately excluded from the admin-vs-classroom
+numerators.
+"""
+)
+
+code(
+    r"""
+fin = cq.build_finance_functions_clean(con)
+cq.quality_report(fin, "finance_functions_clean", con,
+                  required_columns=["unitid", "year", "control", "function", "amount"])
+cq.load_to_duckdb(fin, "finance_functions_clean", con)
+cq.save_interim(fin, cfg, "finance_functions_clean.parquet")
+
+# Spot-assert the crosswalk against known raw values (design §1.1 / §10).
+def _amt(unitid, year, control, function):
+    m = fin[(fin.unitid == unitid) & (fin.year == year) &
+            (fin.control == control) & (fin.function == function)]
+    return float(m["amount"].iloc[0])
+
+gasb_instr = _amt(100654, 2022, "public", "instruction")       # F1C011
+fasb_instr = _amt(100690, 2022, "private_np", "instruction")   # F2E011
+print(f"GASB UNITID 100654 instruction (F1C011) = {gasb_instr:,.0f}")
+print(f"FASB UNITID 100690 instruction (F2E011) = {fasb_instr:,.0f}")
+assert gasb_instr == 34969711.0, gasb_instr
+assert fasb_instr == 2518813.0, fasb_instr
+
+# No cross-standard contamination: public rows -> F1*, private_np rows -> F2*.
+bad = fin[((fin.control == "public") & (~fin.source_col.str.startswith("F1"))) |
+          ((fin.control == "private_np") & (~fin.source_col.str.startswith("F2")))]
+assert len(bad) == 0, f"cross-standard contamination in {len(bad)} rows"
+print("✓ Crosswalk spot-values match; no cross-standard contamination.")
+"""
+)
+
+code(
+    r"""
+# Per-sector × function × year nonzero coverage (design §10). Surfaces any
+# reporting hole and documents that the CORRECTED academic_support (F1C051 /
+# F2E041) is well-populated in BOTH sectors (the design's 'GASB-sparse' claim
+# was the wrong column and no longer applies).
+coverage = cq.run_sql(
+    '''
+    SELECT control, year, function,
+           COUNT(*) FILTER (WHERE amount IS NOT NULL AND amount <> 0) AS nonzero,
+           COUNT(*) AS total
+    FROM finance_functions_clean
+    GROUP BY control, year, function
+    ORDER BY function, control, year
+    ''', con)
+print(coverage.to_string(index=False))
+
+ac = coverage[coverage.function == "academic_support"]
+print("\\nacademic_support coverage (corrected F1C051 / F2E041):")
+print(ac.to_string(index=False))
+"""
+)
+
+code(
+    r"""
+# Sidecar per-standard grand totals + FASB reconciliation check (design §10).
+tot = cq.build_finance_totals_clean(con)
+cq.quality_report(tot, "finance_totals_clean", con,
+                  required_columns=["unitid", "year", "control", "raw_total"])
+cq.load_to_duckdb(tot, "finance_totals_clean", con)
+cq.save_interim(tot, cfg, "finance_totals_clean.parquet")
+
+# FASB: F2E131 >= sum of the six function totals, for every FASB row.
+recon = cq.run_sql(
+    '''
+    SELECT COUNT(*) AS n_rows,
+           COUNT(*) FILTER (
+             WHERE TRY_CAST(F2E131 AS DOUBLE) >= COALESCE(TRY_CAST(F2E011 AS DOUBLE),0)
+                + COALESCE(TRY_CAST(F2E021 AS DOUBLE),0) + COALESCE(TRY_CAST(F2E031 AS DOUBLE),0)
+                + COALESCE(TRY_CAST(F2E041 AS DOUBLE),0) + COALESCE(TRY_CAST(F2E051 AS DOUBLE),0)
+                + COALESCE(TRY_CAST(F2E061 AS DOUBLE),0)
+           ) AS n_total_ge_sum
+    FROM ipeds_finance_fasb_2022_raw
+    ''', con)
+print(recon.to_string(index=False))
+assert int(recon.n_rows.iloc[0]) == int(recon.n_total_ge_sum.iloc[0]), "FASB total < sum of functions"
+print("✓ FASB total (F2E131) >= sum of function totals for all rows.")
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 5 — `fte_clean` (12-month FTE)
+
+One row per `UNITID × year`: `fte_total = FTEUG + FTEGD` from the re-ingested
+EFIA file (B1). `FTEGD` is null for institutions with no graduate programs, so
+both terms are coalesced to 0. This is IPEDS's own authoritative 12-month FTE —
+no headcount approximation (design §4). `03-prepare` divides each function
+amount by `fte_total`; null/zero-FTE institutions are dropped from per-FTE views
+there (reported), kept in absolute views.
+"""
+)
+
+code(
+    r"""
+fte = cq.build_fte_clean(con)
+cq.quality_report(fte, "fte_clean", con, required_columns=["unitid", "year", "fte_total"])
+cq.load_to_duckdb(fte, "fte_clean", con)
+cq.save_interim(fte, cfg, "fte_clean.parquet")
+
+zero_fte = cq.run_sql(
+    "SELECT year, COUNT(*) FILTER (WHERE fte_total IS NULL OR fte_total = 0) AS zero_or_null, "
+    "COUNT(*) AS total FROM fte_clean GROUP BY year ORDER BY year", con)
+print("FTE null/zero counts (dropped from per-FTE views in 03):")
+print(zero_fte.to_string(index=False))
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 6 — `charges_clean` (sticker price)
+
+One row per `UNITID × year` with the three undergraduate residency tiers. The
+IC_AY dictionary mapping (design §7) is **`TUITION1` = in-district, `TUITION2` =
+in-state, `TUITION3` = out-of-state**, with the matching `FEE1/2/3`. This is the
+**published list price** and has a time series (2012 & 2022). It is kept
+**DISTINCT** from Scorecard net price (next step) — the two are never combined.
+
+> **⭐ 2012 now carries real tuition (upstream ingest fix).** The earlier
+> `ipeds_charges_2012_raw` was malformed — a trailing comma in `ic2012_ay.csv`
+> gave every row one more field than the header, so pandas' C parser promoted
+> `UNITID` to the row index and shifted every labeled column left by one. Because
+> IPEDS interleaves `X*` imputation-flag columns (holding `"R"`) with the data
+> columns, `UNITID` absorbed the `"R"` flag and the real tuition landed in the
+> adjacent flag column — the all-`"R"` symptom. `01-ingest` was repaired to read
+> IC2012 with `index_col=False` (keeping UNITID as data, dropping the empty
+> trailing field); 2022 was unaffected (no trailing comma). Re-running
+> `build_charges_clean` here propagates the fix forward — **nothing in
+> `charges_clean` is edited directly** — so the 2012 rows now carry real numeric
+> `TUITION1/2/3` + `FEE1/2/3` instead of nulls.
+"""
+)
+
+code(
+    r"""
+charges = cq.build_charges_clean(con)
+cq.quality_report(charges, "charges_clean", con, required_columns=["unitid", "year"], max_null_pct=0.95)
+cq.load_to_duckdb(charges, "charges_clean", con)
+cq.save_interim(charges, cfg, "charges_clean.parquet")
+print("Rows per year:", charges.groupby("year").size().to_dict())
+print("Columns:", charges.columns.tolist())
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 7 — `net_price_clean` (Scorecard net price — kept DISTINCT)
+
+One row per `UNITID` (a single most-recent-cohort **snapshot**, no `year`):
+`net_price_pub` (`NPT4_PUB`), `net_price_priv` (`NPT4_PRIV`), `cost_attendance`
+(`COSTT4_A`). This is **net price after grant aid** — what students actually pay
+— and is a different quantity from sticker price. It lives in its own table and
+is a present-day context layer only (not inflation-adjusted into the panel; §7).
+"""
+)
+
+code(
+    r"""
+netp = cq.build_net_price_clean(con)
+cq.quality_report(netp, "net_price_clean", con, required_columns=["unitid"], max_null_pct=0.95)
+cq.load_to_duckdb(netp, "net_price_clean", con)
+cq.save_interim(netp, cfg, "net_price_clean.parquet")
+print("Non-null net price:",
+      cq.run_sql("SELECT COUNT(net_price_pub) AS pub, COUNT(net_price_priv) AS priv FROM net_price_clean", con)
+      .to_dict("records")[0])
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 8 — `cpi_clean` (inflation deflators)
+
+One row per `year`: `cpi_all_items` (CUUR0000SA0) + `cpi_tuition_subindex`
+(CUUR0000SEEB01), from the **M13 annual-average** rows. `cpi_u_raw.year` and
+`.value` are stored as text, so we `TRY_CAST(year AS INTEGER)` /
+`TRY_CAST(value AS DOUBLE)` before any filter (design §5). We then **assert an
+M13 row exists for both 2012 and 2022 with a positive `cpi_all_items`** — failing
+loudly otherwise, because without CY2022 the 2021-22 dollars can't be deflated.
+All-Items is the only deflator; the tuition subindex is for the
+tuition-vs-general-inflation comparison only (never deflates spending).
+"""
+)
+
+code(
+    r"""
+cpi = cq.build_cpi_clean(con)
+cq.quality_report(cpi, "cpi_clean", con, required_columns=["year", "cpi_all_items"], max_null_pct=0.5)
+cq.load_to_duckdb(cpi, "cpi_clean", con)
+cq.save_interim(cpi, cfg, "cpi_clean.parquet")
+
+anchors = cpi[cpi.year.isin([2012, 2022])][["year", "cpi_all_items"]].set_index("year")["cpi_all_items"].to_dict()
+print("CPI-U All-Items annual averages at the two anchor years:", anchors)
+for y in (2012, 2022):
+    assert y in anchors and anchors[y] and anchors[y] > 0, f"missing/invalid CPI All-Items for {y}"
+print(f"✓ Deflator ready — 2012 dollars scale to 2022 by x{anchors[2022]/anchors[2012]:.4f}")
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Step 9 — Carry caveats into `_sources` + `SOURCES.md`
+
+The harmonized `_clean` tables get `_sources` rows recording the methodology and
+series-break caveats so they reach chart footnotes downstream: the GASB/FASB
+O&M-allocation difference (the primary comparability caveat), the
+dictionary-correction (GASB functions are `F1C*`, not `F1E*`; FASB total is
+`F2E131`, not `F2E071`), the IPEDS 2012↔2022 series break, and institution
+enter/exit between years. (`SOURCES.md` carries the same notes in prose.)
+"""
+)
+
+code(
+    r"""
+HARMONIZED_METHOD = (
+    "Harmonized GASB (public, F1C* expense-by-function block) and FASB (private "
+    "nonprofit, F2E* block) onto one shared 6-function schema (instruction, research, "
+    "public_service, academic_support, student_services, institutional_support), each "
+    "row tagged control. GASB function codes dictionary-confirmed as F1C011/021/031/051/"
+    "061/071 (the draft's F1E01-07 are the scholarships/grants block, not functions). "
+    "Admin = institutional support only (F1C071 / F2E061). Per-standard grand totals "
+    "(GASB F1C191 / FASB F2E131, never F2E071) kept in finance_totals_clean for "
+    "reconciliation only; the share denominator is the in-pipeline function sum."
+)
+HARMONIZED_BREAKS = (
+    "GASB isolates operation-and-maintenance of plant as its own function while FASB "
+    "distributes it into the other functions, so harmonized functions are comparable only "
+    "to within that O&M-allocation difference and raw totals are never compared across "
+    "standards. IPEDS finance definitions shifted 2011-12 vs 2021-22 (two series, not a "
+    "continuous panel; subcomponent column sets changed, so only stable function-total "
+    "codes are used). Institutions enter/exit between 2012 and 2022 (HD 7,735 -> 6,256)."
+)
+for t in ["finance_functions_clean", "finance_totals_clean"]:
+    cq.register_source(
+        con, table=t, name="IPEDS Finance GASB+FASB (harmonized, NCES)",
+        url="https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+        license="Public domain (U.S. federal government work)",
+        notes="Harmonized expenses-by-function spine for the admin-vs-classroom analysis.",
+        retrieved=RETRIEVED, methodology=HARMONIZED_METHOD, series_breaks=HARMONIZED_BREAKS,
+    )
+cq.register_source(
+    con, table="hd_clean", name="IPEDS Institutional Characteristics (NCES)",
+    url="https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+    license="Public domain (U.S. federal government work)",
+    notes="Institution directory (state, sector, control, level) stacked for 2012 + 2022.",
+    retrieved=RETRIEVED,
+    methodology="HD header stacked across the two collection years with a literal year column.",
+    series_breaks="Institutions enter/exit between 2012 and 2022; over-time aggregates note the changing set.",
+)
+cq.register_source(
+    con, table="fte_clean", name="IPEDS 12-month FTE (EFIA, NCES)",
+    url="https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+    license="Public domain (U.S. federal government work)",
+    notes="fte_total = FTEUG + FTEGD (reported 12-month undergraduate + graduate FTE).",
+    retrieved=RETRIEVED,
+    methodology="Authoritative IPEDS 12-month FTE; no headcount approximation (EFFY has no FTE).",
+    series_breaks="IPEDS definitions shifted 2011-12 vs 2021-22.",
+)
+cq.register_source(
+    con, table="charges_clean", name="IPEDS Charges / sticker price (IC_AY, NCES)",
+    url="https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+    license="Public domain (U.S. federal government work)",
+    notes="Published tuition & required fees. TUITION1=in-district, 2=in-state, 3=out-of-state (+FEE1/2/3).",
+    retrieved=RETRIEVED, methodology="Sticker/list price; kept distinct from Scorecard net price.",
+    series_breaks="Sticker != net price (reported separately). IPEDS 2012 vs 2022 definition shifts.",
+)
+cq.register_source(
+    con, table="net_price_clean", name="College Scorecard net price (Dept. of Education)",
+    url="https://collegescorecard.ed.gov/data/",
+    license="Public domain (U.S. federal government work)",
+    notes="Average net price after grant aid (NPT4_PUB/NPT4_PRIV) + cost of attendance (COSTT4_A).",
+    retrieved=RETRIEVED, methodology="Most-recent-cohort snapshot; net price, NOT sticker price.",
+    series_breaks="Single latest-cohort snapshot, not a time series; not inflation-adjusted into the panel.",
+)
+cq.register_source(
+    con, table="cpi_clean", name="BLS CPI-U annual averages (All Items + tuition subindex)",
+    url=cfg["sources"]["cpi_u"]["api_url"], license="Public domain (U.S. federal government work)",
+    notes="M13 annual averages. cpi_all_items = deflator; cpi_tuition_subindex = comparison only.",
+    retrieved=RETRIEVED, methodology="BLS public API; deflate to constant 2022 dollars with All-Items.",
+    series_breaks="CPI-U base 1982-84=100, NSA; used only as a ratio.",
+)
+print("Registered _sources for all 7 _clean tables.")
+cq.get_sources(con)[["duckdb_table", "source_name"]]
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Verify — interim artifacts + `_clean` tables
+
+Confirm every interim Parquet file was written and every `_clean` DuckDB table
+exists with the expected row count.
+"""
+)
+
+code(
+    r"""
+INTERIM = ["hd_clean", "finance_functions_clean", "finance_totals_clean",
+           "fte_clean", "charges_clean", "net_price_clean", "cpi_clean"]
+interim_dir = Path(cfg["paths"]["data_interim"])
+print(f"{'table':<28}{'parquet?':<10}{'db rows':>10}")
+print("-" * 48)
+for t in INTERIM:
+    pq = interim_dir / f"{t}.parquet"
+    assert pq.exists(), f"missing interim parquet: {pq}"
+    n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    print(f"{t:<28}{'yes':<10}{n:>10,}")
+print("\\nAll 7 interim Parquet files written and all 7 _clean tables created.")
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    """
+## Cleanup
+
+DuckDB is single-writer — a notebook that leaves its connection open holds a
+lock that blocks other notebooks, scripts, and DBCode. Always close it.
+"""
+)
+
+code(
+    """
+con.close()
+print("DuckDB connection closed.")
+"""
+)
+
+md(
+    """
+---
+**Next:** `03-prepare.ipynb` — join the harmonized finance spine to `hd_clean` +
+`fte_clean`, normalize per 12-month FTE, deflate to constant-2022 dollars with
+`cpi_clean`, build the chart-ready `chart_*` tables, and export the
+`higher_education_cost_v1` package with a codebook.
+"""
+)
+
+# ---------------------------------------------------------------------------
+nb["cells"] = cells
+nb["metadata"] = {
+    "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+    "language_info": {"name": "python"},
+}
+
+out = Path("notebooks/02-clean.ipynb")
+nbf.write(nb, str(out))
+print("Wrote", out, "with", len(cells), "cells")
