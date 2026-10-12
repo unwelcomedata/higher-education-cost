@@ -485,6 +485,205 @@ def build_chart_tuition_vs_cpi(con) -> pd.DataFrame:
     return run_sql(sql, con)
 
 
+# ---------------------------------------------------------------------------
+# REFRAME — "big education" relative-inflation chart-ready tables
+# ---------------------------------------------------------------------------
+#
+# Suspicion 1 of SECTOR-COMPARISON-INVESTIGATION: has the cost of higher
+# education outpaced general inflation and the other "big" sectors? These two
+# builders turn the interim cpi_sectors_clean (CPI-U sector subindices, annual
+# averages, 1979-2025) into the chart-ready tables the reframed 04-viz consumes.
+# 03 OWNS this shaping; 04 only reads it.
+
+# The reframe window floor: the college-tuition subindex begins Dec 1978, so
+# 1979 is the common base year every sector is re-indexed to 100 at.
+CPI_BASE_YEAR = 1979
+
+# Hospital services (CUUR0000SEMD) begins Dec 1996 — kept in the data but EXCLUDED
+# from the 1979-base headline chart (it cannot anchor the common window). Charts
+# that use the common 1979 base filter it out; it remains available for a
+# late-window detail panel if ever wanted.
+CPI_HEADLINE_EXCLUDE = ("Hospital services",)
+
+
+def build_chart_cpi_indexed(con) -> pd.DataFrame:
+    """chart_cpi_indexed — every CPI sector re-indexed to 100 at the 1979 base.
+
+    One row per (sector × year): the sector's annual-average index value divided
+    by its OWN value in the base year 1979, ×100. So every sector starts at
+    exactly 100.0 in 1979 and the line's height in any later year is the
+    cumulative price change since 1979 (e.g. 400 = prices quadrupled). This is
+    the classic "which line is steepest" multi-sector inflation chart; college
+    tuition is reliably the steepest.
+
+    Columns:
+        sector     — human sector name (All items, College tuition & fees, …)
+        series_id  — the BLS CUUR series ID (provenance)
+        year       — calendar year (1979 … latest full year)
+        value      — raw CPI-U annual-average index (published 1982-84=100 base)
+        value_1979 — the sector's own 1979 annual-average value (the re-base divisor)
+        index_1979base — value / value_1979 × 100 (the charted value; 100.0 in 1979)
+        in_headline    — TRUE for the 8 sectors on the 1979 common window; FALSE for
+                         hospital services (starts 1996, excluded from the headline)
+
+    All sectors are kept (incl. hospital services) so a consumer can choose; the
+    reframed headline chart filters to in_headline = TRUE.
+    """
+    exclude_sql = ", ".join(f"'{s}'" for s in CPI_HEADLINE_EXCLUDE)
+    sql = f"""
+    WITH base AS (
+        SELECT series_id, value AS value_1979
+        FROM cpi_sectors_clean
+        WHERE year = {CPI_BASE_YEAR}
+    )
+    SELECT s.sector,
+           s.series_id,
+           s.year,
+           s.value,
+           b.value_1979,
+           100.0 * s.value / b.value_1979 AS index_1979base,
+           (s.sector NOT IN ({exclude_sql})) AS in_headline
+    FROM cpi_sectors_clean s
+    JOIN base b USING (series_id)
+    WHERE s.year >= {CPI_BASE_YEAR}
+    ORDER BY s.sector, s.year
+    """
+    return run_sql(sql, con)
+
+
+def build_chart_cpi_pct_change(con) -> pd.DataFrame:
+    """chart_cpi_pct_change — total % price change per sector since 1979 (ranked).
+
+    One row per sector: the cumulative percent change in the CPI-U annual-average
+    index from the 1979 base year to the latest full year available, i.e.
+    (value_latest / value_1979 − 1) × 100. This is the one-number / ranked-bar
+    version of the indexed line chart (tuition on top).
+
+    Columns:
+        sector      — human sector name
+        series_id   — BLS CUUR series ID (provenance)
+        base_year   — 1979 (the common base)
+        latest_year — latest full year in the data (e.g. 2024/2025)
+        value_1979  — annual-average index in 1979
+        value_latest— annual-average index in the latest year
+        pct_change_since_1979 — (value_latest / value_1979 − 1) × 100, the ranked value
+        pct_label   — pre-formatted "+NNN%" string for the bar label
+        in_headline — TRUE for the 8 common-window sectors; FALSE for hospital services
+
+    Ordered by pct_change_since_1979 descending (tuition first).
+    """
+    exclude_sql = ", ".join(f"'{s}'" for s in CPI_HEADLINE_EXCLUDE)
+    sql = f"""
+    WITH base AS (
+        SELECT series_id, value AS value_1979
+        FROM cpi_sectors_clean WHERE year = {CPI_BASE_YEAR}
+    ),
+    latest AS (
+        SELECT series_id, MAX(year) AS latest_year
+        FROM cpi_sectors_clean GROUP BY series_id
+    ),
+    latest_val AS (
+        SELECT s.series_id, s.year AS latest_year, s.value AS value_latest
+        FROM cpi_sectors_clean s JOIN latest l
+          ON s.series_id = l.series_id AND s.year = l.latest_year
+    )
+    SELECT c.sector,
+           c.series_id,
+           {CPI_BASE_YEAR} AS base_year,
+           lv.latest_year,
+           b.value_1979,
+           lv.value_latest,
+           100.0 * (lv.value_latest / b.value_1979 - 1.0) AS pct_change_since_1979,
+           ('+' || CAST(ROUND(100.0 * (lv.value_latest / b.value_1979 - 1.0)) AS INTEGER) || '%')
+               AS pct_label,
+           (c.sector NOT IN ({exclude_sql})) AS in_headline
+    FROM (SELECT DISTINCT sector, series_id FROM cpi_sectors_clean) c
+    JOIN base b      USING (series_id)
+    JOIN latest_val lv USING (series_id)
+    ORDER BY pct_change_since_1979 DESC
+    """
+    return run_sql(sql, con)
+
+
+def build_chart_cpi_vs_allitems(con) -> pd.DataFrame:
+    """chart_cpi_vs_allitems — each sector's price change RELATIVE TO All Items.
+
+    The "above/below general inflation" reframe of the %-change bar (option "b").
+    Where chart_cpi_pct_change measures each sector's TOTAL % change since 1979,
+    this measures how much each sector OUT-RAN (or lagged) general inflation over
+    the SAME window:
+
+        pct_vs_allitems = (sector_index_latest / allitems_index_latest - 1) * 100
+
+    equivalently ((100 + sector_pct) / (100 + allitems_pct) - 1) * 100. So All
+    Items sits at exactly 0 (it is the reference/zero point), sectors that beat
+    general inflation are positive, and sectors that lagged it are negative. This
+    is the diverging-bar table: college tuition is the largest positive bar;
+    energy/gasoline land near or below zero.
+
+    One row per sector (headline sectors only — the 1979 common window; hospital
+    services is excluded, same as chart_cpi_pct_change). All Items is kept as a
+    row (value 0.0) so the chart can show it as the labeled reference baseline in
+    its own distinct color.
+
+    Columns:
+        sector      — human sector name
+        series_id   — BLS CUUR series ID (provenance)
+        base_year   — 1979 (the common base)
+        latest_year — latest full year in the data
+        index_latest        — the sector's own 1979-based index at the latest year
+        allitems_index_latest — All Items' 1979-based index at the latest year (the divisor)
+        pct_vs_allitems — (index_latest / allitems_index_latest - 1) * 100; the diverging value
+        pct_vs_allitems_label — pre-formatted "+NNN%"/"-NN%" string for the bar
+        is_allitems — TRUE for the All Items reference row (value 0.0)
+        in_headline — TRUE for the 8 common-window sectors
+
+    Ordered by pct_vs_allitems descending (tuition first, laggards at the bottom).
+    """
+    exclude_sql = ", ".join(f"'{s}'" for s in CPI_HEADLINE_EXCLUDE)
+    sql = f"""
+    WITH base AS (
+        SELECT series_id, value AS value_1979
+        FROM cpi_sectors_clean WHERE year = {CPI_BASE_YEAR}
+    ),
+    latest AS (
+        SELECT series_id, MAX(year) AS latest_year
+        FROM cpi_sectors_clean GROUP BY series_id
+    ),
+    latest_val AS (
+        SELECT s.sector, s.series_id, s.year AS latest_year, s.value AS value_latest
+        FROM cpi_sectors_clean s JOIN latest l
+          ON s.series_id = l.series_id AND s.year = l.latest_year
+    ),
+    indexed AS (
+        SELECT lv.sector, lv.series_id, lv.latest_year,
+               100.0 * lv.value_latest / b.value_1979 AS index_latest
+        FROM latest_val lv JOIN base b USING (series_id)
+    ),
+    allitems AS (
+        SELECT index_latest AS allitems_index_latest, latest_year
+        FROM indexed WHERE sector = 'All items'
+    )
+    SELECT i.sector,
+           i.series_id,
+           {CPI_BASE_YEAR} AS base_year,
+           i.latest_year,
+           i.index_latest,
+           a.allitems_index_latest,
+           100.0 * (i.index_latest / a.allitems_index_latest - 1.0) AS pct_vs_allitems,
+           (CASE WHEN (i.index_latest / a.allitems_index_latest - 1.0) >= 0 THEN '+' ELSE '' END
+             || CAST(ROUND(100.0 * (i.index_latest / a.allitems_index_latest - 1.0)) AS INTEGER)
+             || '%') AS pct_vs_allitems_label,
+           (i.sector = 'All items') AS is_allitems,
+           (i.sector NOT IN ({exclude_sql})) AS in_headline
+    FROM indexed i
+    CROSS JOIN allitems a
+    WHERE i.sector NOT IN ({exclude_sql})
+    ORDER BY pct_vs_allitems DESC
+    """
+    return run_sql(sql, con)
+
+
 def value_counts_all(df: pd.DataFrame, top_n: int = 10) -> None:
     """Print top-N value counts for every column — quick sanity check."""
     for col in df.columns:

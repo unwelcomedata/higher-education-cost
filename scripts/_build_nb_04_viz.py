@@ -583,6 +583,314 @@ show(img)
 
 # ---------------------------------------------------------------------------
 md(
+    r"""
+---
+
+# ⭐ REFRAME — "big education" vs the inflation of other sectors
+
+Everything above (charts 1–5b) is the **original admin-vs-classroom exploration**
+— kept intact as a valued exploration record. The charts below are the **reframe**
+(`SECTOR-COMPARISON-INVESTIGATION.md`): the project's new headline question is
+**has the cost of higher education outpaced general inflation AND the other "big"
+sectors** culture argues about — big pharma / healthcare, big oil / energy — plus
+housing?
+
+These consume the two chart-ready tables `03-prepare` built from the CPI-U sector
+subindices (`chart_cpi_indexed`, `chart_cpi_pct_change`), read-only. No `chart_*`
+table is built here. All annual-average CPI-U, NSA, 1979 → latest full year, each
+sector re-indexed to 100 at **1979** (the floor set by the college-tuition
+subindex, which begins Dec 1978). **Prior art:** this is the longer-window
+extension of the AEI / Mark-Perry "Chart of the Century" — cited, not copied.
+
+**Titles describe, they don't conclude** (per the workspace viz rule).
+"""
+)
+
+code(
+    r"""
+# Confirm the reframe chart tables are present (03 built them), read-only.
+for t in ["chart_cpi_indexed", "chart_cpi_pct_change"]:
+    assert (PROCESSED / f"{t}.parquet").exists(), f"{t} missing — run 03-prepare first."
+    n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    assert n > 0, f"{t} is empty."
+    print(f"OK  {t:<24} rows={n}")
+LATEST = int(con.execute("SELECT MAX(year) FROM chart_cpi_indexed").fetchone()[0])
+print("latest full year in the CPI sector data:", LATEST)
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    r"""
+## R1 — "Why don't we ever talk about 'Big Education'?"  *(HEADLINE / lead chart, multi-line)*
+
+The classic "which line is steepest" chart: every CPI-U sector re-indexed so
+**1979 = 100**, plotted 1979 → latest. A line's height in any year is the
+cumulative price change since 1979 (e.g. 400 = prices quadrupled). College
+tuition & fees is the steepest line by a wide margin. Eight sectors on the common
+1979 window (hospital services, which starts 1996, is excluded here).
+
+> **⭐ Provocative title — intentional, owner-approved per-chart opt-in.** The
+> workspace default is "titles describe, don't conclude," but this is the week's
+> **lead / introduction chart for a controversial-tier project**, so the owner
+> explicitly asked for a provocative headline here: **"Why don't we ever talk
+> about 'Big Education'?"**. This is a deliberate exception for **R1 ONLY** — do
+> NOT "fix" it back to a descriptive title, and do NOT make any other chart in
+> this notebook (R2, R3, the diverging bar, the slopegraphs) provocative. The
+> subtitle stays informative (source = BLS CPI-U, base year 1979, indexed to 100).
+
+*Source: `chart_cpi_indexed` (consumed read-only; `in_headline` sectors only).
+BLS CPI-U, U.S. city average, NSA, annual averages, 1979 = 100. The tuition
+subindex tracks published (sticker) price, not net-of-aid.*
+
+> **End-label de-overlap.** Near the right edge the medical-care cluster
+> ("Medical care services" / "Medical care (all)" / "Prescription drugs") bunches
+> together, so their direct end-of-line labels would overprint. The shared
+> `line` template now spreads near-equal endpoint labels to a minimum vertical gap
+> (a behavior-preserving fix — it only engages when labels actually collide), so
+> every sector label reads cleanly beside its own line end.
+"""
+)
+
+code(
+    r"""
+# Pivot the long indexed table to wide (one column per sector) for the line template.
+d_idx = con.execute(
+    "SELECT year, sector, index_1979base FROM chart_cpi_indexed "
+    "WHERE in_headline ORDER BY year"
+).df()
+wide_idx = d_idx.pivot_table(index="year", columns="sector",
+                             values="index_1979base").reset_index()
+
+# Order the series by their latest-year value (steepest first) so the legend /
+# end-labels read top-to-bottom in rank order; pin tuition to the brand spice.
+order = (d_idx[d_idx["year"] == LATEST]
+         .sort_values("index_1979base", ascending=False)["sector"].tolist())
+SECTOR_COLORS = {
+    "College tuition & fees": c("spice"),   # the headline line — warm, stands out
+    "Medical care services":  c("navy"),
+    "Medical care (all)":     c("teal"),
+    "Prescription drugs":     c("aqua"),
+    "Shelter":                c("gold"),
+    "All items":              c("gray"),     # the baseline reference line
+    "Energy":                 c("cyan"),
+    "Gasoline":               c("brown_red"),
+}
+series = [{"col": s, "label": s, "color": SECTOR_COLORS.get(s, c("gray"))} for s in order]
+
+img = cf._render_line(
+    {
+        "table": wide_idx[["year"] + order],
+        "x_col": "year",
+        "series": series,
+        "x_axis_label": "Year",
+        "y_axis_label": "Price index (1979 = 100)",
+        "y_min": 100,
+        "markers": False,
+        "label_last": True,
+        "legend": True,
+        "x_tick_step": 5,
+        # ⭐ Provocative LEAD-chart title — owner-approved per-chart exception to
+        # the "titles describe, don't conclude" rule (R1 only; see markdown note).
+        "title": "Why don\u2019t we ever talk about \u201CBig Education\u201D?",
+        "subtitle": f"BLS CPI-U, U.S. city average, NSA, annual averages, 1979\u2013{LATEST}. "
+                    f"1979 = 100. Higher line = larger cumulative price rise.",
+    },
+    None,
+)
+show(img)
+
+print("Indexed values at", LATEST, "(1979 = 100), steepest first:")
+print(d_idx[d_idx["year"] == LATEST].sort_values("index_1979base", ascending=False)
+      [["sector", "index_1979base"]].round(1).to_string(index=False))
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    r"""
+## R2 — The "big" sectors head-to-head  *(reduced multi-line)*
+
+The same chart stripped to the cultural "big pharma / big oil / big education"
+cut: **college tuition** vs **healthcare** (medical care services) vs **energy**
+(or gasoline) vs **All Items** — four clean lines, 1979 = 100. Easier to read
+than the full eight-line headline and the version most likely to carry a post.
+
+*Source: `chart_cpi_indexed` (consumed read-only; four sectors). BLS CPI-U, NSA,
+1979 = 100.*
+"""
+)
+
+code(
+    r"""
+BIG4 = ["College tuition & fees", "Medical care services", "Energy", "All items"]
+d_big = con.execute(
+    "SELECT year, sector, index_1979base FROM chart_cpi_indexed "
+    "WHERE sector IN ('College tuition & fees','Medical care services','Energy','All items') "
+    "ORDER BY year"
+).df()
+wide_big = d_big.pivot_table(index="year", columns="sector",
+                             values="index_1979base").reset_index()
+big_order = (d_big[d_big["year"] == LATEST]
+             .sort_values("index_1979base", ascending=False)["sector"].tolist())
+big_series = [{"col": s, "label": s, "color": SECTOR_COLORS.get(s, c("gray"))} for s in big_order]
+
+img = cf._render_line(
+    {
+        "table": wide_big[["year"] + big_order],
+        "x_col": "year",
+        "series": big_series,
+        "x_axis_label": "Year",
+        "y_axis_label": "Price index (1979 = 100)",
+        "y_min": 100,
+        "markers": False,
+        "label_last": True,
+        "legend": True,
+        "x_tick_step": 5,
+        "title": "\u201CBig\u201D sectors head-to-head: tuition, healthcare, energy, all items",
+        "subtitle": f"BLS CPI-U, U.S. city average, NSA, 1979\u2013{LATEST}. 1979 = 100. "
+                    f"Education vs big healthcare vs big energy vs general inflation.",
+    },
+    None,
+)
+show(img)
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    r"""
+## R3 — the one-number bar, in TWO variants
+
+The one-number companion to the headline line chart comes in two framings. The
+owner picked **option "b" (the diverging bar) as the PRIMARY reframe**, and asked
+to **keep option "a" (the total-% bar) in the notebook for comparison**. Both are
+built below so the difference is obvious. **Only R1 carries the provocative title;
+both bars here are DESCRIPTIVE.**
+
+- **Option b — PRIMARY:** each sector relative to **All Items** (how much it
+  out-ran / lagged general inflation). All Items = 0, tuition the largest positive
+  bar. The "above the inflation line / below it" reading, which is the more
+  interesting cut.
+- **Option a — COMPARISON (kept):** each sector's **total** % increase since 1979,
+  with All Items drawn as a **reference line** so you can still read who sits above
+  vs below general inflation on the raw-growth scale.
+
+### R3b (PRIMARY) — How much each sector out-ran general inflation since 1979  *(diverging bar, option "b")*
+
+Every sector recentred on **All Items**: `pct_vs_allitems = (sector_index /
+allitems_index − 1) × 100`. All Items is the **zero baseline** (its own distinct
+colour, labelled as the reference); sectors that **beat** general inflation sit to
+the right, sectors that **lagged** it to the left. College tuition & fees is the
+largest positive bar by a wide margin; gasoline / energy land near or below zero.
+
+**Colour rule (per the brief):** All Items gets its **own** distinct colour (the
+reference / zero point). Every *actual* sector uses the standard diverging
+above/below-zero colours — **college tuition is NOT given a unique highlight
+colour here** (it stands out by length, not hue).
+
+*Source: `chart_cpi_vs_allitems` (consumed read-only; `in_headline` sectors). BLS
+CPI-U, NSA; each sector's cumulative price change recentred on All Items.*
+"""
+)
+
+code(
+    r"""
+d_vs = con.execute(
+    "SELECT sector, pct_vs_allitems, pct_vs_allitems_label, is_allitems "
+    "FROM chart_cpi_vs_allitems WHERE in_headline ORDER BY pct_vs_allitems DESC"
+).df()
+print(d_vs.to_string(index=False))
+
+# Colour rule: All Items (the zero/reference row) gets its OWN distinct colour via
+# `highlight`; every actual sector takes the standard diverging above/below-zero
+# colours (pos = teal_dark beat inflation, neg = spice lagged it). College tuition
+# is deliberately NOT highlighted — it reads by bar length, not a unique hue.
+img = cf._render_diverging_bars(
+    {
+        "table": d_vs[["sector", "pct_vs_allitems", "pct_vs_allitems_label"]],
+        "category_col": "sector",
+        "value_col": "pct_vs_allitems",
+        "label_col": "pct_vs_allitems_label",
+        "pos_color": c("teal_dark"),   # beat general inflation (right of zero)
+        "neg_color": c("spice"),       # lagged general inflation (left of zero)
+        "highlight": {"category": "All items", "color": c("gold"),
+                      "annotation": "general inflation (reference = 0)"},
+        "zero_label": "All items (general inflation) = 0",
+        "sort": True,
+        "img_height": 760,
+        "title": f"How much each sector out-ran general inflation, 1979 \u2192 {LATEST}",
+        "subtitle": "BLS CPI-U, U.S. city average, NSA. Each sector's cumulative price change "
+                    "since 1979 vs All Items (All items = 0; right = beat inflation, left = lagged).",
+    },
+    None,
+)
+show(img)
+
+nonref = d_vs[~d_vs["is_allitems"]].sort_values("pct_vs_allitems", ascending=False)
+print("\nTop 3 sectors that beat general inflation most (pct vs All Items):")
+print(nonref.head(3)[["sector", "pct_vs_allitems"]].to_string(index=False))
+print("Bottom 3 (lagged / least out-ran general inflation):")
+print(nonref.tail(3)[["sector", "pct_vs_allitems"]].to_string(index=False))
+print(f"College tuition & fees vs All Items: "
+      f"{float(nonref[nonref.sector=='College tuition & fees']['pct_vs_allitems'].iloc[0]):+.1f}%")
+"""
+)
+
+md(
+    r"""
+### R3a (COMPARISON, kept) — Total price increase by sector since 1979, vs the inflation line  *(ranked bar, option "a")*
+
+The original one-number framing, **kept for comparison** so the two cuts sit side
+by side. Total **percent increase from 1979 to the latest full year** per sector,
+ranked (tuition on top), with **All Items drawn as a dashed reference line** — so
+you can read who sits **above vs below general inflation** without recentring the
+scale. This is the AEI-style "here is the single number" companion; the diverging
+R3b above is the same information recentred on that inflation line.
+
+*Source: `chart_cpi_pct_change` (consumed read-only; `in_headline` sectors). BLS
+CPI-U, NSA; `(index_latest / index_1979 − 1) × 100`. All Items reference value is
+the All-Items row of the same table.*
+"""
+)
+
+code(
+    r"""
+d_pct = con.execute(
+    "SELECT sector, pct_change_since_1979, pct_label FROM chart_cpi_pct_change "
+    "WHERE in_headline ORDER BY pct_change_since_1979 DESC"
+).df()
+print(d_pct.to_string(index=False))
+
+# All Items total % change = the reference line (who's above vs below inflation).
+all_items_pct = float(d_pct[d_pct["sector"] == "All items"]["pct_change_since_1979"].iloc[0])
+print(f"\nAll Items reference line at +{all_items_pct:.0f}%")
+
+img = cf._render_single_ranked_bars(
+    {
+        "table": d_pct,
+        "category_col": "sector",
+        "value_col": "pct_change_since_1979",
+        "label_col": "pct_label",
+        "bar_color": c("teal"),
+        "highlight": {"category": "College tuition & fees", "color": c("spice")},
+        # Option "a": draw All Items as a reference line so the chart reads
+        # "who's above vs below the inflation line" on the raw-growth scale.
+        "ref_line": {"value": all_items_pct, "color": c("gold"),
+                     "label": f"All items (general inflation) +{all_items_pct:.0f}%"},
+        "sort": "desc",
+        "title": f"Total price increase by sector, 1979 \u2192 {LATEST} (vs the inflation line)",
+        "subtitle": "BLS CPI-U, U.S. city average, NSA. Cumulative % change since 1979; dashed line = "
+                    "All Items (general inflation). Comparison version of the diverging chart above.",
+    },
+    None,
+)
+show(img)
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
     """
 ## Takeaways to review (framing only — nothing published yet)
 
@@ -613,6 +921,37 @@ a two-point before/after.
 
 These are exploratory framings for owner review — **not** final social charts. No
 `06-viz-social` / web rendering is built in this stage.
+
+---
+
+### ⭐ REFRAME takeaways (the new headline direction)
+
+- **R1 (headline, indexed line — the provocative LEAD):** titled "Why don't we
+  ever talk about 'Big Education'?" (the one owner-approved provocative title; see
+  the note above the chart). With every sector re-indexed to 100 at 1979,
+  **college tuition & fees is the steepest line by a wide margin** — it reaches
+  ~**1,477** by the latest year (≈ **+1,377%** since 1979), far above the next
+  sector, **medical care services ~942 (+842%)**, and roughly **3×** general
+  inflation (All items ~443, +343%). This directly makes "big education" visible.
+  End-of-line labels in the medical-care cluster are now de-overlapped (shared
+  `line` template fix) so each reads beside its own line end.
+- **R2 (big-4 cut):** the cultural "big pharma / big oil / big education" framing
+  reads cleanly in four lines — tuition rises fastest, big healthcare second,
+  energy/gasoline track near or below general inflation.
+- **R3b (PRIMARY — diverging vs All Items, option "b"):** recentred on general
+  inflation, **tuition out-ran All Items by ~+233%** (the largest positive bar),
+  medical-care services ~+112%, medical-care (all) ~+94% — the top three above the
+  inflation line. Below it: **gasoline ~−10% and energy ~−4%** (they LAGGED general
+  inflation), with shelter ~+36% just above. All Items sits at 0 in its own colour;
+  tuition reads by length, not a highlight colour.
+- **R3a (COMPARISON — ranked total %, option "a", kept):** the same sectors on the
+  raw-growth scale with All Items drawn as a dashed reference line (+343%). Tuition
+  on top; the reference line makes "above vs below general inflation" readable
+  without recentring. (Hospital services shows a larger raw % but is correctly
+  excluded from the 1979 headline — its CPI series only starts 1996.)
+- These confirm the reframe's Suspicion 1 (relative inflation) is a strong,
+  defensible headline. Suspicion 2 (is the driver admin vs instruction) is a
+  LATER ingest (Delta Cost Project + IPEDS HR) — not built in this stage.
 """
 )
 

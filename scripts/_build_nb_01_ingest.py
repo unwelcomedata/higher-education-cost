@@ -464,6 +464,174 @@ print("Registered cpi_u_raw.")
 
 # ---------------------------------------------------------------------------
 md(
+    r"""
+## Source 3b (REFRAME) — BLS CPI-U **sector subindices** · the "big education" relative-inflation set
+
+> **Why this source exists — the project reframe.** The project's new headline
+> question is: has the **cost of higher education outpaced general inflation and
+> the other sectors culture labels "big"** (big pharma / healthcare, big oil /
+> energy) plus housing? The canonical way to answer it is to pull one **CPI-U
+> subindex per sector**, re-index each to 100 in a common base year, and plot the
+> lines — "which line is steepest." College tuition is reliably the steepest.
+> See `artifacts/SECTOR-COMPARISON-INVESTIGATION.md` §1 for the full design.
+
+**This is ingestion of a NEW data source (the sector subindices), so it belongs
+here in `01-ingest`.** All series are **CPI-U, U.S. city average, NOT seasonally
+adjusted** (the `CUUR0000…` prefix = CPI-**U** / area 0000 / **U**nadjusted).
+They are pulled with the same keyless `fetch_bls_series()` used above.
+
+**Series pulled** (series ID → human name → earliest BLS data):
+
+| BLS series ID | Human name | Earliest |
+|---|---|---|
+| `CUUR0000SA0` | All Items (the general-inflation baseline) | 1913 |
+| `CUUR0000SEEB01` | **College tuition & fees** ⭐ | **Dec 1978** |
+| `CUUR0000SAM` | Medical care (all) | 1935 |
+| `CUUR0000SAM2` | Medical care services (big-healthcare line) | 1956 |
+| `CUUR0000SEMF01` | Prescription drugs (big-pharma line) | ~1947 |
+| `CUUR0000SETB01` | Gasoline, all types (big-oil line) | 1976 |
+| `CUUR0000SA0E` | Energy (aggregate) | 1957 |
+| `CUUR0000SAH1` | Shelter / housing | 1953 |
+| `CUUR0000SEMD` | Hospital & related services *(optional)* | **Dec 1996** |
+
+**⭐ The common window is 1979.** The college-tuition subindex `CUUR0000SEEB01`
+**begins December 1978** — the shortest series — so the clean common base for
+indexing every sector to 100 is **1979 → latest** (~46 years). Every other sector
+above reaches further back than 1978 and is simply truncated to the common start.
+`CUUR0000SEMD` (hospital services) begins **1996**, so it must **not** anchor the
+1979 window and is kept **out of the headline chart** (a late-window detail only).
+
+**Caveats to carry forward** (written into `_sources.series_breaks` below and
+SOURCES.md): tuition subindex starts Dec-1978 (the window floor); hospital
+services starts 1996; **NSA only** — never mix in a `CUUS…`/`CUSR…` seasonally-
+adjusted ID (the gasoline trap: use `CUUR0000SETB01`, not the `CUUS` twin); CPI
+subindices embed BLS hedonic quality adjustment and periodic weight updates; the
+tuition subindex tracks **published-price** movement, not net-of-aid price.
+
+**Keyless BLS API windowing.** The public API returns **≤10 years per request**
+(25 requests/day), so the 1979→2025 span is fetched in **five ≤10-year windows**,
+with **all nine series IDs batched into each call** (≈5 calls total, not one call
+per series per year). An optional `BLS_API_KEY` in the gitignored `.env` raises
+the limits but is not required.
+
+**Prior art (cited, not copied).** This chart is the longer-window extension of
+the AEI / Mark J. Perry **"Chart of the Century"** — the well-known "price change
+by sector since ~2000" line chart built from exactly these BLS CPI subindices. We
+**cite it as the methodology reference / prior art** and differentiate by (a) a
+longer window back to 1979, (b) the explicit "big pharma / big oil / big
+education" framing, and (c) our own brand styling. We do **not** reproduce its
+image or text. (humanprogress.org / AEI publish it annually.)
+"""
+)
+
+code(
+    r"""
+import pandas as pd
+
+cpi_cfg = cfg["sources"]["cpi_u"]
+sector_series = list(cpi_cfg["series"].keys())           # all 9 CUUR sector IDs
+sec_start = int(cpi_cfg.get("sectors_start_year", 1979))  # 1979 (tuition floor)
+sec_end   = int(cpi_cfg.get("sectors_end_year", 2025))    # request through 2025
+api_key = os.environ.get("BLS_API_KEY")                   # optional; gitignored .env
+
+# Build <=10-year windows across 1979..2025. ALL nine series are batched into
+# ONE call per window (not one call per series) to respect the 25 req/day limit:
+# e.g. 1979-1988, 1989-1998, 1999-2008, 2009-2018, 2019-2025  ->  5 calls total.
+windows = []
+w0 = sec_start
+while w0 <= sec_end:
+    w1 = min(w0 + 9, sec_end)
+    windows.append((w0, w1))
+    w0 = w1 + 1
+print(f"Fetching {len(sector_series)} CPI sector series over {len(windows)} windows "
+      f"(<=10 yr each, all series batched per call): {windows}")
+
+frames = []
+for (sy, ey) in windows:
+    frames.append(fetch_bls_series(sector_series, sy, ey, annual=True, api_key=api_key))
+df_sectors = pd.concat(frames, ignore_index=True)
+
+# Save the raw long-format payload verbatim to data/raw (this IS the raw artifact).
+sectors_dest = raw_path(cfg, "cpi_u/cpi_sectors_raw.csv")
+df_sectors.to_csv(sectors_dest, index=False)
+
+# Load UNTOUCHED into DuckDB — raw stage, no transforms (cleaning is 02-clean).
+load_to_duckdb(df_sectors, "cpi_sectors_raw", con)
+
+print("Saved raw CSV :", sectors_dest)
+print("cpi_sectors_raw: rows =", f"{df_sectors.shape[0]:,}", " cols =", df_sectors.shape[1])
+yr_min, yr_max = con.execute(
+    "SELECT MIN(TRY_CAST(year AS INT)), MAX(TRY_CAST(year AS INT)) FROM cpi_sectors_raw"
+).fetchone()
+print("Year range    :", yr_min, "->", yr_max)
+print("Series present:", sorted(con.execute(
+    "SELECT DISTINCT series_id FROM cpi_sectors_raw"
+).df()["series_id"].tolist()))
+"""
+)
+
+code(
+    r"""
+# Representative peek — annual-average (M13) index values for a few sectors at
+# the window floor (1979) and a recent year, confirming the raw table loaded.
+con.execute(
+    "SELECT series_id, year, period, value FROM cpi_sectors_raw "
+    "WHERE period='M13' AND series_id IN ('CUUR0000SA0','CUUR0000SEEB01','CUUR0000SAM2','CUUR0000SETB01') "
+    "AND year IN ('1979','2024') ORDER BY series_id, year"
+).df()
+"""
+)
+
+code(
+    r"""
+# Per-series earliest annual-average (M13) year — confirms the common-window
+# story: tuition (SEEB01) floors at ~1979, hospital services (SEMD) at ~1996.
+con.execute(
+    "SELECT series_id, MIN(TRY_CAST(year AS INT)) AS first_year, "
+    "MAX(TRY_CAST(year AS INT)) AS last_year, COUNT(*) AS n_rows "
+    "FROM cpi_sectors_raw WHERE period='M13' GROUP BY series_id ORDER BY first_year, series_id"
+).df()
+"""
+)
+
+code(
+    r"""
+register_source(
+    con,
+    table="cpi_sectors_raw",
+    name="BLS CPI-U sector subindices (big-education relative-inflation set)",
+    url=cpi_cfg["api_url"],
+    license="Public domain (U.S. federal government work)",
+    notes=("BLS CPI for All Urban Consumers, U.S. city average, NSA. Nine sector subindices for the "
+           "reframed 'has higher-ed cost outpaced other sectors' headline: CUUR0000SA0 (All Items), "
+           "CUUR0000SEEB01 (college tuition & fees), CUUR0000SAM (medical care all), CUUR0000SAM2 "
+           "(medical care services), CUUR0000SEMF01 (prescription drugs), CUUR0000SETB01 (gasoline "
+           "all types), CUUR0000SA0E (energy), CUUR0000SAH1 (shelter), CUUR0000SEMD (hospital & "
+           "related services, optional/late-window). Long format: series_id, year, period "
+           "(M01-M12 monthly, M13 annual avg), value. Fetched 1979-2025 via the keyless BLS public "
+           "API in five <=10-year windows, all series batched per call. Prior art: AEI/Mark-Perry "
+           "'Chart of the Century' — extended here with a longer 1979 window and our own framing "
+           "(cited, not copied)."),
+    retrieved=RETRIEVED,
+    methodology=("BLS public timeseries API v2 (keyless), M13 annual averages, 1979-2025, U.S. city "
+                 "average, NOT seasonally adjusted. Each sector re-indexed to 100 at a common base "
+                 "year (1979) in 03-prepare; the published 1982-84=100 base is irrelevant once "
+                 "re-indexed. Gasoline uses the CUUR (unadjusted) ID, never the CUUS SA twin."),
+    series_breaks=("College-tuition subindex CUUR0000SEEB01 begins Dec 1978 -> sets the 1979 common "
+                   "window; every other sector reaches further back and is truncated to it. "
+                   "Hospital & related services CUUR0000SEMD begins Dec 1996 -> excluded from the "
+                   "1979 common window / headline chart (late-window detail only). NSA only (never "
+                   "mix with CUUS/CUSR seasonally-adjusted IDs). CPI subindices embed BLS hedonic "
+                   "quality adjustment and periodic weight updates; the tuition subindex tracks "
+                   "published (sticker-ish) price movement, not net-of-grant-aid price. Subindex "
+                   "scope/title revisions over time (e.g. prescription drugs) apply per BLS docs."),
+)
+print("Registered cpi_sectors_raw.")
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
     """
 ## Verify — raw tables + provenance
 

@@ -66,6 +66,25 @@ Copy and fill in for each source:
 - **Notes:** **The flat-file host `https://download.bls.gov/pub/time.series/cu/` returns HTTP 403 (Akamai block page) to automated GETs — confirmed 2026-09-30 even with a full browser header set — so CPI-U is pulled from the BLS public API instead.** The API is keyless for modest use (25 requests/day, ≤10 years per request; the 2000–2024 span is fetched in two windows); an optional `BLS_API_KEY` in the gitignored `.env` raises the limits but is not required. CPI-U reference base is 1982-84=100; NSA (do not mix with seasonally adjusted). Nominal tuition growth is misleading; inflation adjustment is required for the "cost over time" story.
 - **Retrieved:** 2026-09-30
 
+### BLS CPI-U sector subindices (REFRAME — "big education" relative inflation)
+- **Publisher:** U.S. Bureau of Labor Statistics
+- **URL:** BLS public timeseries API `https://api.bls.gov/publicAPI/v2/timeseries/data/`
+- **Format:** JSON (API) → saved as long-format CSV in `data/raw/cpi_u/cpi_sectors_raw.csv`; DuckDB table `cpi_sectors_raw`
+- **License:** Public domain (U.S. federal government work)
+- **Fields used / series pulled** (all CPI-U, U.S. city average, **NOT seasonally adjusted** — `CUUR0000…` prefix):
+  - `CUUR0000SA0` — All Items (general-inflation baseline; 1913)
+  - `CUUR0000SEEB01` — **College tuition & fees** (⭐ starts **Dec 1978** — the binding constraint that sets the 1979 common window)
+  - `CUUR0000SAM` — Medical care, all (1935)
+  - `CUUR0000SAM2` — Medical care services (big-healthcare line; 1956)
+  - `CUUR0000SEMF01` — Prescription drugs (big-pharma line; ~1947)
+  - `CUUR0000SETB01` — Gasoline, all types (big-oil line; 1976) — **the CUUR unadjusted ID, never the `CUUS` seasonally-adjusted twin**
+  - `CUUR0000SA0E` — Energy, aggregate (1957)
+  - `CUUR0000SAH1` — Shelter / housing (1953)
+  - `CUUR0000SEMD` — Hospital & related services (optional; starts **Dec 1996** — late-window detail only, NOT the headline)
+- **Coverage:** U.S., annual averages (M13), pulled **1979–2025** in five ≤10-year windows (all series batched per call)
+- **Notes:** This is the data behind the project's **reframed headline** — "has higher-education cost outpaced general inflation and the other 'big' sectors (big pharma/healthcare, big oil/energy) + housing?". Each sector is re-indexed to **100 at a common base year 1979** in `03-prepare` and plotted as a multi-line "which line is steepest" chart; college tuition is reliably the steepest. **Common window = 1979** because the college-tuition subindex begins Dec 1978 (every other sector reaches further back and is truncated to it); hospital services (1996) is excluded from the headline. **NSA only** — never mix with `CUUS…`/`CUSR…` seasonally-adjusted series. CPI subindices embed BLS hedonic quality adjustment and periodic weight updates; the tuition subindex tracks **published (sticker-ish) price** movement, not net-of-grant-aid price (consistent with the project's sticker-vs-net rule). **Prior art (cited, not copied):** the AEI / Mark J. Perry *"Chart of the Century"* is exactly this chart over a ~2000 window — we extend it with a longer 1979 window and our own "big education" framing, and reproduce none of its image or text.
+- **Retrieved:** 2026-10 (reframe ingest).
+
 #### IPEDS 12-month FTE (EFIA) — re-ingested in 02-clean
 - **Publisher:** NCES, U.S. Dept. of Education. **URL:** `https://nces.ed.gov/ipeds/datacenter/data/EFIA<year>.zip`. **License:** public domain.
 - **Fields used:** `FTEUG` (reported 12-month undergraduate FTE) + `FTEGD` (reported 12-month graduate FTE); one row per `UNITID`. **Why re-ingested:** the originally-loaded EFFY file carries 12-month *headcount* only — no FTE and no full-time/part-time split — so there is no viable FTE approximation. EFIA is IPEDS's own authoritative 12-month FTE, required for the per-FTE metric. Lands as `ipeds_fte_2012_raw` / `ipeds_fte_2022_raw`; `fte_clean` computes `fte_total = FTEUG + FTEGD`.

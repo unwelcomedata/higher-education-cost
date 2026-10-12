@@ -165,10 +165,20 @@ md(
 `cpi_u_raw` as first ingested stopped at **2019** (the keyless BLS API returns
 ≤10 years/request and the earlier two-window pull truncated). Without a **CY2022
 annual-average (`M13`) All-Items** value, the 2021-22 dollars **cannot be
-deflated** (design §5). We re-pull `CUUR0000SA0` (All Items) and
-`CUUR0000SEEB01` (college-tuition subindex) across **three ≤10-year windows**
-(2000–2009 / 2010–2019 / 2020–2024) so the series reaches 2024, and overwrite
-`cpi_u_raw`.
+deflated** (design §5). We need `CUUR0000SA0` (All Items) and `CUUR0000SEEB01`
+(college-tuition subindex) through 2022 — just the **two deflator / tuition-
+comparison series**, not the full sector set.
+
+**⭐ Quota-robust re-ingest (no wasted API calls).** The reframe's `01-ingest`
+already pulled `cpi_sectors_raw` — which **contains these same two series
+(`CUUR0000SA0`, `CUUR0000SEEB01`) across 1979–2025**, M13 annual averages, from
+the SAME keyless BLS API. Because the public API is capped at **25 requests/day**
+and the reframe ingest already spends several, this cell **prefers to rebuild
+`cpi_u_raw` from `cpi_sectors_raw`** (zero network calls, identical BLS values).
+It only falls back to a live `fetch_bls_series` pull if, for any reason,
+`cpi_sectors_raw` is absent or missing a 2022 anchor. Either path lands the same
+`cpi_u_raw` long-format table (series_id, year, period, value, …) with the
+required M13 anchors.
 
 Same stage-gate note as B1: this is ingestion, done here as a labeled re-ingest
 section using the existing `src/ingest.py::fetch_bls_series`, and `_sources` is
@@ -179,13 +189,36 @@ re-registered. `BLS_API_KEY` (gitignored `.env`) is optional.
 code(
     r"""
 cpi_cfg = cfg["sources"]["cpi_u"]
-series_ids = list(cpi_cfg["series"].keys())
+# cpi_u is the deflator + tuition-comparison layer: ONLY these two series.
+DEFLATOR_SERIES = ["CUUR0000SA0", "CUUR0000SEEB01"]
 api_key = os.environ.get("BLS_API_KEY")   # optional
 
-frames = []
-for (sy, ey) in [(2000, 2009), (2010, 2019), (2020, 2024)]:
-    frames.append(fetch_bls_series(series_ids, sy, ey, annual=True, api_key=api_key))
-df_cpi = pd.concat(frames, ignore_index=True)
+def _cpi_from_sectors():
+    '''Rebuild the two deflator series from the already-ingested cpi_sectors_raw
+    (same BLS API, same values, 1979-2025) — no network call.'''
+    have = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
+    if "cpi_sectors_raw" not in have:
+        return None
+    df = con.execute(
+        "SELECT series_id, year, period, period_name, value, footnotes "
+        "FROM cpi_sectors_raw WHERE series_id IN ('CUUR0000SA0','CUUR0000SEEB01')"
+    ).df()
+    if df.empty:
+        return None
+    # Must carry the 2022 All-Items M13 anchor, else it is not usable as a deflator.
+    anchor = df[(df.series_id == "CUUR0000SA0") & (df.period == "M13") & (df.year.astype(str) == "2022")]
+    return df if len(anchor) else None
+
+df_cpi = _cpi_from_sectors()
+source_path = "rebuilt from cpi_sectors_raw (no API call)"
+if df_cpi is None:
+    # Fallback: live pull of ONLY the two deflator series, windowed <=10 yr.
+    print("cpi_sectors_raw unavailable/incomplete — falling back to a live BLS pull.")
+    frames = []
+    for (sy, ey) in [(2000, 2009), (2010, 2019), (2020, 2024)]:
+        frames.append(fetch_bls_series(DEFLATOR_SERIES, sy, ey, annual=True, api_key=api_key))
+    df_cpi = pd.concat(frames, ignore_index=True)
+    source_path = "live BLS fetch_bls_series (3 windows)"
 
 # Overwrite the raw artifact on disk + the raw table (this IS the BLS raw artifact).
 cpi_dest = raw_path(cfg, "cpi_u/cpi_u_raw.csv")
@@ -197,21 +230,126 @@ m13_count = con.execute(
     "SELECT COUNT(*) FROM cpi_u_raw WHERE series_id='CUUR0000SA0' AND period='M13' "
     "AND year IN ('2012','2022')"
 ).fetchone()[0]
-print(f"cpi_u_raw: rows={len(df_cpi):,}  year range {yr_min}-{yr_max}  "
+print(f"cpi_u_raw ({source_path}): rows={len(df_cpi):,}  year range {yr_min}-{yr_max}  "
       f"All-Items M13 rows for 2012 & 2022 = {m13_count}")
-assert m13_count == 2, "CPI re-pull did not land M13 annual averages for both 2012 and 2022"
+assert m13_count == 2, "cpi_u_raw is missing an M13 All-Items annual average for 2012 and/or 2022"
 
 cq.register_source(
     con, table="cpi_u_raw", name="BLS CPI-U (All Items + college tuition subindex)",
     url=cpi_cfg["api_url"], license="Public domain (U.S. federal government work)",
     notes=("BLS CPI for All Urban Consumers. CUUR0000SA0 (All Items, NSA) = real-dollar deflator; "
            "CUUR0000SEEB01 (college tuition & fees subindex) = tuition-vs-general-inflation comparison "
-           "ONLY (never used to deflate spending). Long format with M13 annual averages, 2000-2024."),
+           "ONLY (never used to deflate spending). Long format with M13 annual averages. Rebuilt from "
+           "cpi_sectors_raw (same BLS API/values) when available to respect the 25-req/day keyless cap."),
     retrieved=RETRIEVED,
-    methodology="BLS public timeseries API v2 (keyless), three <=10-year windows to reach 2024.",
+    methodology=("BLS public timeseries API v2 (keyless). Rebuilt from the already-ingested "
+                 "cpi_sectors_raw (both series present 1979-2025) to avoid extra API calls; falls "
+                 "back to a live 3-window pull if that table is unavailable."),
     series_breaks="CPI-U base 1982-84=100, NSA. Used only as a ratio, so the base is irrelevant to deflation.",
 )
-print("B2 OK — CPI-U re-pulled through", yr_max)
+print("B2 OK — cpi_u_raw ready through", yr_max)
+"""
+)
+
+# ---------------------------------------------------------------------------
+md(
+    r"""
+## Step 1b (REFRAME) — `cpi_sectors_clean` (CPI sector subindices → interim)
+
+Clean the raw CPI **sector subindices** (`cpi_sectors_raw`, ingested in
+`01-ingest` for the "big education vs other sectors" reframe) into the interim
+table **`cpi_sectors_clean`**. This is a light, DuckDB-only pass — the raw table
+is already tidy long-format from the BLS API; cleaning just:
+
+1. **keeps the annual-average rows only** (`period = 'M13'`) — one value per
+   sector per year, dropping the monthly rows;
+2. **casts** `year` → INTEGER and `value` → DOUBLE (the API returns both as text);
+3. **keeps** `series_id, year, value`;
+4. **adds a human `sector` label column** from the config `series` map, so
+   downstream charts never have to carry raw CUUR codes.
+
+Saved as interim Parquet (`cpi_sectors_clean.parquet`) via the same
+`save_interim` pattern used by every other `_clean` table. The re-indexing to a
+common 1979 base (the chart-ready transform) is **`03-prepare`'s** job, not here
+— `02` only standardizes.
+
+**Caveats carried forward** (into `_sources`): NSA only; the college-tuition
+subindex (`CUUR0000SEEB01`) begins Dec-1978 → the common-window floor is 1979;
+hospital services (`CUUR0000SEMD`) begins 1996 → excluded from the 1979 headline
+window; CPI embeds hedonic/weighting adjustment; the tuition subindex is a
+published-price (not net-of-aid) measure.
+"""
+)
+
+code(
+    r"""
+# Human sector labels from config (keep the short, chart-friendly phrasing).
+SECTOR_LABELS = {
+    "CUUR0000SA0":    "All items",
+    "CUUR0000SEEB01": "College tuition & fees",
+    "CUUR0000SAM":    "Medical care (all)",
+    "CUUR0000SAM2":   "Medical care services",
+    "CUUR0000SEMF01": "Prescription drugs",
+    "CUUR0000SETB01": "Gasoline",
+    "CUUR0000SA0E":   "Energy",
+    "CUUR0000SAH1":   "Shelter",
+    "CUUR0000SEMD":   "Hospital services",
+}
+
+# Register the label map as a tiny DuckDB relation so the whole clean is SQL.
+labels_df = pd.DataFrame(
+    [{"series_id": k, "sector": v} for k, v in SECTOR_LABELS.items()]
+)
+cq.load_to_duckdb(labels_df, "_cpi_sector_labels", con)
+
+cpi_sectors = cq.run_sql(
+    '''
+    SELECT r.series_id,
+           TRY_CAST(r.year AS INTEGER) AS year,
+           TRY_CAST(r.value AS DOUBLE) AS value,
+           l.sector
+    FROM cpi_sectors_raw r
+    LEFT JOIN _cpi_sector_labels l USING (series_id)
+    WHERE r.period = 'M13'                 -- annual averages only
+      AND TRY_CAST(r.value AS DOUBLE) IS NOT NULL
+    ORDER BY r.series_id, year
+    ''',
+    con,
+)
+con.execute("DROP TABLE IF EXISTS _cpi_sector_labels")  # scratch, not an artifact
+
+cq.quality_report(cpi_sectors, "cpi_sectors_clean", con,
+                  required_columns=["series_id", "year", "value", "sector"])
+cq.load_to_duckdb(cpi_sectors, "cpi_sectors_clean", con)
+cq.save_interim(cpi_sectors, cfg, "cpi_sectors_clean.parquet")
+
+# Every series must carry a non-null human label (no unmapped CUUR codes left).
+unmapped = cpi_sectors[cpi_sectors["sector"].isna()]["series_id"].unique().tolist()
+assert not unmapped, f"CPI series missing a sector label: {unmapped}"
+print("Sectors cleaned:", sorted(cpi_sectors["sector"].unique()))
+print("Year span      :", int(cpi_sectors["year"].min()), "->", int(cpi_sectors["year"].max()))
+print("Rows per sector:\n", cpi_sectors.groupby("sector").size().to_string())
+"""
+)
+
+code(
+    r"""
+cq.register_source(
+    con, table="cpi_sectors_clean",
+    name="BLS CPI-U sector subindices (cleaned, annual averages)",
+    url=cfg["sources"]["cpi_u"]["api_url"],
+    license="Public domain (U.S. federal government work)",
+    notes=("Annual-average (M13) CPI-U NSA sector subindices for the big-education relative-inflation "
+           "headline: All items, college tuition & fees, medical care (all), medical care services, "
+           "prescription drugs, gasoline, energy, shelter, hospital services. One row per series_id x "
+           "year with a human 'sector' label; re-indexed to a 1979 common base in 03-prepare."),
+    retrieved=RETRIEVED,
+    methodology="Light DuckDB clean of cpi_sectors_raw: keep M13 annual averages, cast year/value, add sector label.",
+    series_breaks=("NSA only. College-tuition subindex (CUUR0000SEEB01) begins Dec-1978 -> 1979 common-window "
+                   "floor; hospital services (CUUR0000SEMD) begins 1996 -> excluded from the 1979 headline. "
+                   "CPI embeds hedonic/weighting adjustment; tuition subindex is published-price, not net-of-aid."),
+)
+print("Registered cpi_sectors_clean.")
 """
 )
 
@@ -652,7 +790,8 @@ exists with the expected row count.
 code(
     r"""
 INTERIM = ["hd_clean", "finance_functions_clean", "finance_totals_clean",
-           "fte_clean", "charges_clean", "net_price_clean", "cpi_clean"]
+           "fte_clean", "charges_clean", "net_price_clean", "cpi_clean",
+           "cpi_sectors_clean"]
 interim_dir = Path(cfg["paths"]["data_interim"])
 print(f"{'table':<28}{'parquet?':<10}{'db rows':>10}")
 print("-" * 48)
@@ -661,7 +800,7 @@ for t in INTERIM:
     assert pq.exists(), f"missing interim parquet: {pq}"
     n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
     print(f"{t:<28}{'yes':<10}{n:>10,}")
-print("\\nAll 7 interim Parquet files written and all 7 _clean tables created.")
+print(f"\\nAll {len(INTERIM)} interim Parquet files written and all {len(INTERIM)} _clean tables created.")
 """
 )
 

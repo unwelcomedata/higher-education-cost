@@ -78,6 +78,9 @@ md(
 | `chart_admin_per_fte_by_state` | stabbr × control | admin $/FTE by state + 2012→2022 change |
 | `chart_admin_per_fte_by_state_top_bottom` | stabbr × control | top-5 + bottom-5 states per sector by admin change |
 | `chart_tuition_vs_cpi` | year | sticker tuition vs CPI All-Items vs CPI tuition subindex |
+| `chart_cpi_indexed` *(reframe)* | sector × year | ⭐ every CPI sector re-indexed to 100 at 1979 — the "which line is steepest" headline |
+| `chart_cpi_pct_change` *(reframe)* | sector | total % price change per sector since 1979 (ranked, tuition on top) |
+| `chart_cpi_vs_allitems` *(reframe)* | sector | ⭐ each sector's % change RELATIVE TO All Items (All Items = 0) — the diverging "above/below general inflation" bar |
 
 **Stage gate:** `04-viz` only begins after these processed + export artifacts
 exist on disk; `04` CONSUMES these tables and must not build `chart_*` tables
@@ -492,6 +495,214 @@ print("\n✓ Tuition deflation verified — 2012 real = 2012 nominal × 1.27466;
 """
 )
 
+# ---------------------------------------------------------------------------
+md(
+    r"""
+## Step 3g (REFRAME) — the "big education" relative-inflation chart tables
+
+The project's reframed headline asks whether the **cost of higher education has
+outpaced general inflation and the other "big" sectors** (big pharma/healthcare,
+big oil/energy) plus housing. `03` OWNS the chart-ready shaping for this, built
+from the interim `cpi_sectors_clean` (CPI-U sector subindices, annual averages,
+1979–2025). `04-viz` only READS these two tables.
+
+**⭐ `chart_cpi_indexed`** — every sector **re-indexed to 100 at the 1979 base
+year** (`value / value_at_1979 × 100`), one row per sector × year. 1979 is the
+common base because the college-tuition subindex (`CUUR0000SEEB01`) begins Dec
+1978 — the shortest series — so it sets the floor; every other sector reaches
+further back and is truncated to it. This is the "which line is steepest"
+multi-line chart. Hospital services (starts 1996) is kept in the table but marked
+`in_headline = FALSE` and excluded from the 1979-base headline (it cannot anchor
+the common window).
+
+**⭐ `chart_cpi_pct_change`** — the one-number / ranked-bar version: total **%
+price change per sector since 1979** = `(value_latest / value_1979 − 1) × 100`,
+ordered descending (tuition on top), with a pre-formatted `pct_label`.
+
+Both are saved to `data/processed/` and created as processed DuckDB `chart_*`
+tables. Base year and the hospital-services exclusion live in `src/prepare.py`
+(`CPI_BASE_YEAR`, `CPI_HEADLINE_EXCLUDE`) so the two tables can never drift.
+"""
+)
+
+code(
+    r"""
+# 3g.1 — indexed-to-100-at-1979 multi-line table.
+c_idx = prep.build_chart_cpi_indexed(con)
+cq.load_to_duckdb(c_idx, "chart_cpi_indexed", con)
+cq.save_processed(c_idx, cfg, "chart_cpi_indexed.parquet")
+
+# Every sector must equal exactly 100.0 at the 1979 base year.
+base_vals = c_idx[c_idx["year"] == prep.CPI_BASE_YEAR][["sector", "index_1979base"]]
+assert np.allclose(base_vals["index_1979base"], 100.0), "a sector is not 100.0 at the 1979 base"
+print(f"✓ All {base_vals['sector'].nunique()} sectors = 100.0 at {prep.CPI_BASE_YEAR}.")
+
+# At the latest year, College tuition & fees must be the HIGHEST indexed value
+# among the headline sectors (the steepest line — the core finding).
+latest = int(c_idx["year"].max())
+head_latest = c_idx[(c_idx["year"] == latest) & (c_idx["in_headline"])] \
+    .sort_values("index_1979base", ascending=False)[["sector", "index_1979base"]]
+print(f"\nIndexed value at {latest} (headline sectors, 1979 = 100):")
+print(head_latest.to_string(index=False))
+assert head_latest.iloc[0]["sector"] == "College tuition & fees", \
+    "College tuition is not the steepest headline line at the latest year"
+print("\n✓ College tuition & fees is the steepest headline line at", latest)
+"""
+)
+
+code(
+    r"""
+# 3g.2 — total % change since 1979, ranked (tuition on top).
+c_pct = prep.build_chart_cpi_pct_change(con)
+cq.load_to_duckdb(c_pct, "chart_cpi_pct_change", con)
+cq.save_processed(c_pct, cfg, "chart_cpi_pct_change.parquet")
+print(c_pct[["sector", "latest_year", "value_1979", "value_latest",
+             "pct_change_since_1979", "pct_label", "in_headline"]].to_string(index=False))
+
+# Tuition must have the largest % change of the headline sectors.
+head_pct = c_pct[c_pct["in_headline"]].sort_values("pct_change_since_1979", ascending=False)
+assert head_pct.iloc[0]["sector"] == "College tuition & fees", \
+    "College tuition is not the largest % change among headline sectors"
+nxt = head_pct.iloc[1]
+print(f"\n✓ Tuition largest % change ({head_pct.iloc[0]['pct_change_since_1979']:.0f}%); "
+      f"next = {nxt['sector']} ({nxt['pct_change_since_1979']:.0f}%).")
+"""
+)
+
+md(
+    r"""
+### 3g.3 ⭐ `chart_cpi_vs_allitems` — each sector relative to All Items  *(the diverging reframe, option "b")*
+
+**WHAT + WHY (the new owner-requested cut).** `chart_cpi_pct_change` above answers
+"how much did each sector rise since 1979?" — a ranked bar with every sector
+positive. The owner wants the **more interesting framing**: how much each sector
+**out-ran (or lagged) general inflation**. This table recentres every sector on
+**All Items**:
+
+> `pct_vs_allitems = (sector_index_latest / allitems_index_latest − 1) × 100`
+
+so **All Items sits at exactly 0** (the reference / zero baseline), sectors that
+beat general inflation are **positive** (right of zero), and sectors that lagged
+it are **negative** (left of zero). This is the data behind the **diverging bar**:
+college tuition is the largest positive bar; energy / gasoline land near or below
+zero. It is a *shaping* op (a derived per-sector column), so it lives here in
+`03-prepare`; `04-viz` only consumes it. Headline sectors only (the 1979 common
+window; hospital services excluded, same as `chart_cpi_pct_change`). The All Items
+row is kept (value 0.0, `is_allitems = TRUE`) so the chart can draw it as the
+labelled reference in its own distinct colour.
+"""
+)
+
+code(
+    r"""
+# 3g.3 — each sector's % change RELATIVE TO All Items (All Items = 0): the diverging bar table.
+c_vs = prep.build_chart_cpi_vs_allitems(con)
+cq.load_to_duckdb(c_vs, "chart_cpi_vs_allitems", con)
+cq.save_processed(c_vs, cfg, "chart_cpi_vs_allitems.parquet")
+print(c_vs[["sector", "index_latest", "allitems_index_latest",
+            "pct_vs_allitems", "pct_vs_allitems_label", "is_allitems"]].to_string(index=False))
+
+# All Items must be exactly 0 (it is the reference point).
+ai = c_vs[c_vs["is_allitems"]]
+assert len(ai) == 1 and abs(float(ai.iloc[0]["pct_vs_allitems"])) < 1e-9, \
+    "All Items is not exactly 0 in the vs-All-Items table"
+# College tuition must be the largest positive bar (beat inflation most).
+nonref = c_vs[~c_vs["is_allitems"]].sort_values("pct_vs_allitems", ascending=False)
+assert nonref.iloc[0]["sector"] == "College tuition & fees", \
+    "College tuition is not the largest positive bar vs All Items"
+top3 = nonref.head(3)[["sector", "pct_vs_allitems"]]
+bot3 = nonref.tail(3)[["sector", "pct_vs_allitems"]]
+print("\n✓ All Items = 0 (reference); College tuition the largest positive bar.")
+print("\nTop 3 sectors that beat general inflation most (pct vs All Items):")
+print(top3.to_string(index=False))
+print("\nBottom 3 sectors (lagged / least out-ran general inflation):")
+print(bot3.to_string(index=False))
+print(f"\nCollege tuition vs All Items: "
+      f"{float(nonref[nonref.sector=='College tuition & fees']['pct_vs_allitems'].iloc[0]):+.1f}%")
+"""
+)
+
+md(
+    r"""
+### Export the "big education" sector-inflation dataset (second package)
+
+The finance spine export above is one grain (institution × year × function); the
+sector-inflation chart data is a different grain (sector × year), so it ships as
+its **own** small export package — `higher_education_cost_cpi_sectors_v1` — with a
+codebook giving a plain-English description for every column. CSV + Excel +
+Parquet, same `package_dataset` helper. This is the sellable dataset behind the
+reframed headline chart.
+"""
+)
+
+code(
+    r"""
+CPI_CODEBOOK = {
+    "sector":        "Human-readable sector name (All items, College tuition & fees, Medical care "
+                     "(all), Medical care services, Prescription drugs, Gasoline, Energy, Shelter, "
+                     "Hospital services).",
+    "series_id":     "BLS CPI-U series ID (CUUR0000… = CPI-U, U.S. city average, not seasonally "
+                     "adjusted) this sector comes from — provenance.",
+    "year":          "Calendar year (1979 … latest full year), the annual-average observation.",
+    "value":         "Raw CPI-U annual-average index value for this sector·year, on BLS's published "
+                     "1982-84 = 100 reference base (irrelevant once re-indexed below).",
+    "value_1979":    "The sector's own CPI-U annual-average index value in the 1979 base year — the "
+                     "divisor used to re-index the sector to 100.",
+    "index_1979base": "value ÷ value_1979 × 100 — the sector's price level re-indexed so 1979 = 100. "
+                      "The charted line value; its height in a later year is the cumulative price "
+                      "change since 1979 (e.g. 400 = prices quadrupled).",
+    "in_headline":   "TRUE for the 8 sectors covering the full 1979 common window; FALSE for Hospital "
+                     "services (CPI series starts Dec 1996, so it is excluded from the 1979-base "
+                     "headline chart).",
+}
+
+CPI_NOTES = '''
+Source: U.S. Bureau of Labor Statistics — Consumer Price Index for All Urban
+Consumers (CPI-U), U.S. city average, NOT seasonally adjusted (CUUR0000… series).
+Public domain (U.S. federal government work). Annual averages (M13), 1979–latest.
+
+What this is: the sector subindices behind the project's reframed headline — "has
+the cost of higher education outpaced general inflation and the other 'big'
+sectors?". Each sector is re-indexed to 100 at the 1979 base year; the line that
+climbs highest has risen most. College tuition & fees is reliably the steepest.
+
+Load-bearing caveats:
+- Common base is 1979 because the college-tuition subindex (CUUR0000SEEB01)
+  begins December 1978; every other sector reaches further back and is truncated
+  to the common start. Hospital services (CUUR0000SEMD) begins December 1996 and
+  is excluded from the 1979 headline window (in_headline = FALSE).
+- NSA only — never mixed with seasonally-adjusted (CUUS/CUSR) series. Gasoline is
+  CUUR0000SETB01 (unadjusted), never its CUUS twin.
+- CPI subindices embed BLS hedonic quality adjustment and periodic weight updates.
+  For these rising cost sectors that effect is minor; disclosed for completeness.
+- The college-tuition subindex tracks PUBLISHED (sticker-ish) price movement, not
+  net-of-grant-aid price.
+Prior art: AEI / Mark J. Perry "Chart of the Century" is the same chart over a
+~2000 window; this dataset extends it to 1979 with its own framing (cited, not
+copied).
+'''.strip()
+
+cpi_export_df = c_idx[["sector", "series_id", "year", "value", "value_1979",
+                       "index_1979base", "in_headline"]].copy()
+missing_cpi = [c for c in cpi_export_df.columns if c not in CPI_CODEBOOK]
+assert not missing_cpi, f"CPI codebook missing descriptions for: {missing_cpi}"
+
+cpi_written = prep.package_dataset(
+    cpi_export_df, cfg, name="higher_education_cost_cpi_sectors_v1",
+    codebook=CPI_CODEBOOK, notes=CPI_NOTES,
+)
+print("CPI-sectors export files written:")
+for fmt, p in cpi_written.items():
+    print(f"  {fmt:<9} {p}  ({p.stat().st_size:,} bytes)")
+
+# Confirm the files exist and the codebook has no placeholder description.
+cpi_cb = Path(cfg["paths"]["export"]) / "higher_education_cost_cpi_sectors_v1_codebook.md"
+assert cpi_cb.exists() and "_No description provided._" not in cpi_cb.read_text(encoding="utf-8"), \
+    "CPI-sectors codebook missing or has placeholder descriptions"
+print("\n✓ CPI-sectors CSV + Excel + Parquet + codebook written; every column described.")
+"""
+)
+
 md(
     """
 ### Confirm all processed artifacts exist
@@ -507,7 +718,9 @@ PROCESSED = ["spend_per_fte",
              "chart_admin_vs_instruction_by_sector", "chart_admin_share_trend",
              "chart_spend_by_function_by_year", "chart_admin_per_fte_by_state",
              "chart_admin_per_fte_by_state_top_bottom",
-             "chart_tuition_vs_cpi"]
+             "chart_tuition_vs_cpi",
+             # REFRAME — "big education" relative-inflation tables.
+             "chart_cpi_indexed", "chart_cpi_pct_change", "chart_cpi_vs_allitems"]
 processed_dir = Path(cfg["paths"]["data_processed"])
 db_tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
 print(f"{'processed table':<42}{'parquet?':<10}{'db?':<6}{'rows':>8}")
@@ -518,7 +731,7 @@ for t in PROCESSED:
     assert t in db_tables, f"missing processed DuckDB table: {t}"
     n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
     print(f"{t:<42}{'yes':<10}{'yes':<6}{n:>8,}")
-print("\n✓ All six processed tables written (Parquet + DuckDB).")
+print(f"\n✓ All {len(PROCESSED)} processed tables written (Parquet + DuckDB).")
 """
 )
 

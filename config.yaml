@@ -68,11 +68,37 @@ sources:
   cpi_u:
     api_url: "https://api.bls.gov/publicAPI/v2/timeseries/data/"
     type: bls_api
+    # REFRAME (2026-10): the series list below is extended from the original two
+    # (All Items + college tuition) to the full set of SECTOR subindices needed
+    # for the "big education vs the other 'big' sectors" relative-inflation
+    # headline (SECTOR-COMPARISON-INVESTIGATION §1a). ALL are CPI-U, U.S. city
+    # average, NOT seasonally adjusted (CUUR prefix). The college-tuition
+    # subindex (CUUR0000SEEB01) begins Dec 1978, so it is the BINDING CONSTRAINT
+    # that sets the common base window at 1979; every other sector reaches
+    # further back. CUUR0000SETB01 (gasoline) MUST be the CUUR unadjusted ID,
+    # never its CUUS seasonally-adjusted twin (do not mix SA and NSA). The window
+    # is widened to 1979→2025 (request through 2025; keep whatever the API
+    # returns). These land in cpi_sectors_raw (01-ingest). The original
+    # All-Items + tuition pair is still used by cpi_u_raw / cpi_clean for
+    # deflation; the sector pull is a separate raw table.
     series:
       CUUR0000SA0:     "CPI-U, All Items, U.S. city average, not seasonally adjusted"
-      CUUR0000SEEB01:  "CPI-U, College tuition and fees subindex, U.S. city average, NSA"
+      CUUR0000SEEB01:  "CPI-U, College tuition and fees subindex, U.S. city average, NSA (starts Dec 1978 — common-window floor)"
+      CUUR0000SAM:     "CPI-U, Medical care (all), NSA"
+      CUUR0000SAM2:    "CPI-U, Medical care services, NSA (big-healthcare services line)"
+      CUUR0000SEMF01:  "CPI-U, Prescription drugs, NSA (big-pharma line)"
+      CUUR0000SETB01:  "CPI-U, Gasoline (all types), NSA (big-oil line — CUUR unadjusted, NEVER the CUUS SA twin)"
+      CUUR0000SA0E:    "CPI-U, Energy (aggregate), NSA"
+      CUUR0000SAH1:    "CPI-U, Shelter / housing, NSA"
+      # Optional: Hospital & related services starts Dec 1996 — SHORTER than
+      # tuition, so it must NOT anchor the 1979 common window and stays OUT of
+      # the headline chart (late-window detail only).
+      CUUR0000SEMD:    "CPI-U, Hospital and related services, NSA (starts Dec 1996 — NOT for the 1979 common window / headline)"
     start_year: 2000
     end_year:   2024
+    # Sector-subindex pull (the reframe) uses a wider window set in 01-ingest:
+    sectors_start_year: 1979
+    sectors_end_year:   2025
 
 export:
   formats:
