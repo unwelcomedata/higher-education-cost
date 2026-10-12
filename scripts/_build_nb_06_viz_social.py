@@ -369,7 +369,8 @@ render_dual({
     "y_fmt": (lambda v: f"${v:,.0f}"),
     "title": f"Published undergraduate tuition & fees, 1963\u201364 to {TUI_LAST}\u2013{str(TUI_LAST+1)[-2:]}",
     "subtitle": f"Constant {TUI_BASE}-{str(TUI_BASE+1)[-2:]} dollars (CPI-U All-Items); 4-year "
-                f"institutions by control. Published (sticker) price.",
+                f"institutions by control. Published (sticker) price, not net of aid. "
+                f"Real prices have flattened/softened in the most recent years.",
     "source": "NCES Digest of Education Statistics, Table 330.10",
 }, "03_tuition_since_1963")
 
