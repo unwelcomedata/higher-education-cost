@@ -150,6 +150,26 @@ reframe's Suspicion-1 "how dramatic is the long tuition climb?" and Suspicion-2
 > analyses). On the HEADCOUNT proxy (IPEDS HR), administrator headcount did outpace
 > faculty and enrollment 2013→present — a complementary, more quotable cut, not a
 > contradiction (headcount ≠ share of dollars). Charts carry this nuance explicitly.
+>
+> **⭐ "Admin" is a definitional choice (chart 4 caveat — carried to the README).**
+> Chart 4's "admin" is **IPEDS institutional support only**, a specific accounting
+> category. Different definitions of administration yield different "bloat"
+> magnitudes, and the choice matters: **microdata analyses of administrator
+> *headcount* — e.g. FIRE / Kay & Honeycutt, 2025 — find MORE administrative growth
+> than the IPEDS spending-share accounting shows.** So "admin spending share is
+> roughly flat (~15%)" is true *for this accounting measure* and does NOT contradict
+> headcount-based findings that administrators grew faster than faculty; the two
+> measure different things (share of dollars vs count of people). Chart 4 and the
+> README state this explicitly so the slopegraph isn't misread as "admin exploded."
+>
+> Plain-English definitions of the four core functional categories (for the README
+> and codebook): **instruction** = teaching activity (faculty salaries, academic
+> departments, instructional operations); **institutional support** (= "admin") =
+> executive management, general administration, finance, HR, legal, and public
+> relations; **academic support** = libraries, academic computing, museums, deans'
+> offices, curriculum development, and other support of the instruction/research
+> mission; **student services** = admissions, the registrar, financial-aid
+> administration, counseling, career services, and student activities.
 
 ---
 
@@ -193,6 +213,19 @@ Carried forward into chart footnotes and the `_sources` `methodology` /
   for 2022. Spending is deflated to **constant 2022 dollars** with All-Items
   only; the tuition subindex is for the tuition-vs-general-inflation comparison
   and never deflates spending.
+- **⭐ Energy and gasoline are volatile (charts 1 & 2 caveat).** Oil-linked CPI
+  sub-indices (gasoline `SETB01`, energy `SA0E`) swing sharply year to year, so a
+  long-window *cumulative* comparison **understates their short-run spikes** —
+  gasoline can sit far above general inflation in any given year even though it
+  *lagged* All Items across the full 1979→present window (which is what charts 1 &
+  2 show). The long-run cumulative framing is the honest comparison for a
+  "which cost rose most over decades" question, but it is not a claim that energy
+  prices are low in any particular year.
+- **⭐ 2025 figures are preliminary (data-vintage note).** The CPI sector series
+  (charts 1 & 2) run into **mid/late 2025**, and **2025 annual averages are still
+  subject to minor revision by BLS**. The headline comparisons (tuition ≈ 3× All
+  Items; ≈ +233% out-performance) are robust to that revision, but the exact 2025
+  index values may shift slightly in later vintages.
 
 ---
 

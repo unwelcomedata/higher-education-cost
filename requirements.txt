@@ -1,26 +1,29 @@
+# higher-education-cost — pinned to what this project actually uses.
+# (playwright, geopandas, python-dotenv dropped: no JS pages, no maps, and the
+#  optional BLS_API_KEY is read from the plain environment, not via dotenv.)
+
 # --- core data ---
 pandas==3.0.5
 duckdb==1.5.5
-pyarrow==25.0.0
+pyarrow==25.0.0               # Parquet engine
 
-# --- web ingestion ---
-requests==2.32.3
-beautifulsoup4==4.12.3
-lxml==5.4.0
-playwright==1.62.0          # for JS-rendered pages; run: playwright install chromium
-
-# --- notebooks ---
-jupyterlab==4.4.3
-ipykernel==6.29.5
-
-# --- viz / social export ---
-matplotlib==3.10.3
-Pillow==12.3.0               # chart rendering (Pillow-based pipeline)
-geopandas==1.0.1             # choropleth maps (optional, only if mapping)
+# --- web / file ingestion ---
+requests==2.32.3              # BLS public API + file downloads
+beautifulsoup4==4.12.3        # static HTML parsing
+lxml==5.4.0                   # parser backend for bs4 / pandas.read_html
 
 # --- data packaging ---
-openpyxl==3.1.5              # Excel export for sellable datasets
+openpyxl==3.1.5               # Excel export for the sellable datasets
 
-# --- config & utilities ---
-pyyaml==6.0.2
-python-dotenv==1.1.1
+# --- viz (exploration drafts in src/viz.py) ---
+matplotlib==3.10.3            # imported by src/viz.py (social/web PNGs render via the shared Pillow factory)
+Pillow==12.3.0                # chart rendering (shared Pillow pipeline)
+
+# --- config ---
+pyyaml==6.0.2                 # config.yaml loader
+
+# --- notebooks / reproduce pipeline ---
+nbformat==5.11.1              # scripts/_build_nb_*.py build the notebooks
+nbconvert==7.17.1             # scripts/reproduce.py executes the pipeline notebooks
+ipykernel==6.29.5
+jupyterlab==4.4.3
