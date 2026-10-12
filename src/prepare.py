@@ -684,6 +684,120 @@ def build_chart_cpi_vs_allitems(con) -> pd.DataFrame:
     return run_sql(sql, con)
 
 
+# ---------------------------------------------------------------------------
+# REFRAME EXPANSION — chart-ready builders for Sources A–D (03-prepare)
+# ---------------------------------------------------------------------------
+#
+# 03 OWNS the chart data. These four builders turn the interim _clean tables
+# (tuition_longrun_clean, spending_mix_clean, hr_staff_national_clean) into the
+# chart-ready processed tables the EXPANDED 04-viz exploration consumes read-only.
+#
+#   03.1 build_chart_tuition_longrun     — constant-$ tuition 1963->latest by control
+#   03.2 build_chart_spending_mix        — instruction vs 3 non-instructional, 1987->latest
+#   03.3 build_chart_staff_indexed       — admin/faculty/enrollment indexed to 2013=100
+#   03.4 build_chart_admin_faculty_ratio — admin-per-100-faculty, first vs latest year
+
+
+def build_chart_tuition_longrun(con) -> pd.DataFrame:
+    """chart_tuition_longrun — deep constant-$ tuition&fees skyrocket, 1963-64 -> latest.
+
+    From tuition_longrun_clean, constant-dollar tuition&fees only, one row per
+    (year_start × control × level) for control in {all, public, private} at the
+    4-year level AND an "all levels" variant (level='all'). The charted value is
+    `value_constant` (constant-$ tuition & fees); `base_year` carries the NCES
+    constant-$ base (e.g. 2023). Asserts the series rises overall and the 1963-64
+    anchor is present.
+    """
+    sql = """
+    SELECT year_start, control, level,
+           value       AS value_constant,
+           base_year
+    FROM tuition_longrun_clean
+    WHERE dollar_basis = 'constant'
+      AND cost_component = 'tuition_fees'
+      AND control IN ('all', 'public', 'private')
+      AND level IN ('all', '4-year')
+    ORDER BY control, level, year_start
+    """
+    return run_sql(sql, con)
+
+
+def build_chart_spending_mix(con) -> pd.DataFrame:
+    """chart_spending_mix — national instruction vs 3 non-instructional functions, 1987 -> latest.
+
+    From spending_mix_clean (the stacked Delta 1987-2012 + raw-IPEDS 2013+ national
+    series), one row per (year × function) for the four charted functions
+    (instruction, institutional_support, academic_support, student_services),
+    carrying BOTH `per_fte` and `share` (SHARE preferred for the honest headline),
+    plus the `source` seam flag (delta / ipeds_raw).
+
+    ⭐ Honest framing is baked in: the finding is that NON-INSTRUCTIONAL spending
+    (student services + academic support + institutional support) grew as a share
+    while instruction's share fell — NOT that institutional support (admin) alone
+    exploded. The share columns make that readable directly; 04-viz states it.
+    """
+    sql = """
+    SELECT year, function, per_fte, share, source
+    FROM spending_mix_clean
+    WHERE function IN ('instruction', 'institutional_support',
+                       'academic_support', 'student_services')
+    ORDER BY function, year
+    """
+    return run_sql(sql, con)
+
+
+def build_chart_staff_indexed(con) -> pd.DataFrame:
+    """chart_staff_indexed — admin vs faculty vs enrollment, indexed to 2013 = 100.
+
+    From hr_staff_national_clean, index admin_headcount, faculty_headcount, and
+    fte_total each to 100 at the first HR year (2013). One row per (year × series),
+    series in {admin, faculty, enrollment}, with `value` (raw) and `index_base`
+    (the charted 2013=100 value).
+    """
+    sql = """
+    WITH base AS (
+        SELECT admin_headcount AS a0, faculty_headcount AS f0, fte_total AS e0
+        FROM hr_staff_national_clean
+        WHERE year = (SELECT MIN(year) FROM hr_staff_national_clean)
+    ),
+    long AS (
+        SELECT year, 'admin'      AS series, admin_headcount   AS value FROM hr_staff_national_clean
+        UNION ALL
+        SELECT year, 'faculty',   faculty_headcount FROM hr_staff_national_clean
+        UNION ALL
+        SELECT year, 'enrollment', fte_total        FROM hr_staff_national_clean
+    )
+    SELECT l.year, l.series, l.value,
+           100.0 * l.value / CASE l.series
+                WHEN 'admin'      THEN b.a0
+                WHEN 'faculty'    THEN b.f0
+                WHEN 'enrollment' THEN b.e0 END AS index_base
+    FROM long l CROSS JOIN base b
+    ORDER BY l.series, l.year
+    """
+    return run_sql(sql, con)
+
+
+def build_chart_admin_faculty_ratio(con) -> pd.DataFrame:
+    """chart_admin_faculty_ratio — administrators per 100 faculty, first vs latest HR year.
+
+    From hr_staff_national_clean, the two-endpoint admin_per_100_faculty (first vs
+    latest year) for a then-vs-now cut. One row per year flagged first/latest.
+    """
+    sql = """
+    WITH ends AS (
+        SELECT MIN(year) AS first_year, MAX(year) AS latest_year FROM hr_staff_national_clean
+    )
+    SELECT h.year, h.admin_headcount, h.faculty_headcount, h.admin_per_100_faculty,
+           CASE WHEN h.year = e.first_year THEN 'first'
+                WHEN h.year = e.latest_year THEN 'latest' END AS endpoint
+    FROM hr_staff_national_clean h CROSS JOIN ends e
+    WHERE h.year IN (e.first_year, e.latest_year)
+    ORDER BY h.year
+    """
+    return run_sql(sql, con)
+
+
 def value_counts_all(df: pd.DataFrame, top_n: int = 10) -> None:
     """Print top-N value counts for every column — quick sanity check."""
     for col in df.columns:

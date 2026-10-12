@@ -91,8 +91,65 @@ Copy and fill in for each source:
 - **Retrieved:** 2026-09-30 (re-ingest).
 
 #### Supplemental (validation / context)
-- **NCES Digest of Education Statistics** — pre-tabulated national/state summary tables (https://nces.ed.gov/programs/digest/) — for cross-checking IPEDS-derived numbers.
 - **SHEEO State Higher Education Finance (SHEF)** — state appropriations & public funding per FTE over time (https://shef.sheeo.org/) — adds the "who pays" (state support vs tuition) dimension.
+
+---
+
+## Reframe-expansion sources (second wave — ingested 2026-10)
+
+Four more authoritative U.S. federal / public-domain sources, added to answer the
+reframe's Suspicion-1 "how dramatic is the long tuition climb?" and Suspicion-2
+"is the driver administration?" questions. Each re-enters at `01-ingest`.
+
+### A. NCES Digest of Education Statistics — Table 330.10 (long tuition history)
+- **Publisher:** National Center for Education Statistics (NCES), U.S. Dept. of Education
+- **URL:** `https://nces.ed.gov/programs/digest/d24/tables/dt24_330.10.asp` (data pulled from the table's companion Excel `.../tables/xls/tabn330.10.xlsx`; the newest edition carrying the full 1963-64 series is auto-selected at build — d24/d23/d22)
+- **Format:** Excel (`.xlsx`) companion of the Digest HTML table → DuckDB `nces_tuition_longrun_raw`
+- **License:** Public domain (U.S. federal government work)
+- **Fields used:** Average undergraduate tuition & fees / room / board, by **control** (all/public/private), **level** (all/4-year/2-year), **dollar basis** (current + constant), selected academic years **1963-64 → 2023-24**. Parsed tidy-long: `academic_year, year_start, control, level, dollar_basis, base_year, cost_component, value`.
+- **Coverage:** U.S. national averages, full-time students, degree-granting institutions, 1963-64 → latest
+- **Notes:** HTML `read_html` cannot parse the multi-level table, so the clean companion Excel is used. Constant-dollar columns are NCES's own **CPI-U All-Items** adjustment (d24 base = **2023-24**). **National averages, not per-institution**; published (**sticker**) price, not net-of-grant-aid; the institution universe and room/board reporting basis shifted across Digest editions; the table NUMBER drifts by edition (345/349/320/330.10). Anchors confirmed: public 4-yr tuition&fees ≈ **$243** (1963-64) → ≈ **$9,750** (2022-23).
+- **Retrieved:** 2026-10
+
+### B. NCES Delta Cost Project Database 1987-2012 (harmonized spending-by-function)
+- **Publisher:** NCES (IPEDS Analytics: Delta Cost Project)
+- **URL:** landing `https://nces.ed.gov/ipeds/use-the-data/delta-cost-project-finance-data`; CSV zip `https://nces.ed.gov/ipeds/deltacostproject/download/IPEDS_Analytics_DCP_87_12_CSV.zip` (~115 MB, two CSVs: `delta_public_87_99.csv`, `delta_public_00_12.csv`)
+- **Format:** ZIP of two CSVs (needed-column subset loaded) → DuckDB `delta_cost_raw`
+- **License:** Public domain (U.S. federal government work)
+- **Fields used:** `unitid, academicyear, control, sector, fte12mn` (constructed 12-mo FTE), `fte_count`, the CFI-method function totals `instruction01 / research01 / pubserv01 / acadsupp01 / studserv01 / instsupp01` (instsupp01 = institutional support = **admin**), `cpi_scalar_2012`. control: 1=public, 2=private-nonprofit, 3=for-profit.
+- **Coverage:** U.S. public + private-nonprofit (+for-profit) institutions, academic years **1986-87 → 2011-12**
+- **Notes:** NCES-harmonized expense-by-function + FTE across the Common-Form / FASB / GASB / Aligned-Form reporting-standard changes, with Delta's own constructed FTE. **Delta is a DERIVED / imputed product — cite Jaquette & Parra, *"The Problem with the Delta Cost Project Database."*** It **ends 2011-12** (a seam to the raw-IPEDS 2013+ finance tail at 2012). Prefer spending **SHARES** over absolute per-FTE where imputation risk is higher. Loaded verbatim; for-profit filtering + per-FTE/SHARE computation happen in 02-clean.
+- **Retrieved:** 2026-10
+
+### C. Raw IPEDS Finance tail 2013-2021 (extend the spending mix to the present)
+- **Publisher:** NCES, U.S. Dept. of Education
+- **URL:** `https://nces.ed.gov/ipeds/datacenter/data/<FILE>.zip` — `F1516_F1A`/`F1516_F2`/`EFIA2016` (FY2016) and `F1819_F1A`/`F1819_F2`/`EFIA2019` (FY2019)
+- **Format:** ZIP of CSV → DuckDB `ipeds_finance_gasb_<yr>_raw`, `ipeds_finance_fasb_<yr>_raw`, `ipeds_fte_<yr>_raw`
+- **License:** Public domain (U.S. federal government work)
+- **Fields used:** GASB `F1C011…F1C071` + FASB `F2E011…F2E061` expense-by-function totals (same crosswalk as the finance spine), EFIA `FTEUG`+`FTEGD` 12-month FTE. Each year's function-total codes are **asserted present before parsing**.
+- **Coverage:** U.S. public (GASB) + private-nonprofit (FASB), FY2016 and FY2019 (mid-points between the project's existing 2012 and 2022)
+- **Notes:** All post-Aligned-Form (2008-10), so the modern `F1C`/`F2E` codes hold (confirmed per year). Harmonized onto Delta's category definitions in 02-clean so the national spending-mix series stacks cleanly across the **2012 seam**. GASB isolates O&M-of-plant while FASB distributes it (O&M excluded from the admin/classroom numerators).
+- **Retrieved:** 2026-10
+
+### D. IPEDS Human Resources `S<year>_OC` (admin vs faculty headcount)
+- **Publisher:** NCES / IPEDS Human Resources component
+- **URL:** `https://nces.ed.gov/ipeds/datacenter/data/S<year>_OC.zip` — S2013_OC, S2016_OC, S2019_OC, S2022_OC
+- **Format:** ZIP of CSV → DuckDB `ipeds_hr_<yr>_raw`
+- **License:** Public domain (U.S. federal government work)
+- **Fields used:** `STAFFCAT` (occupation × full/part-time), `FTPT` (1 = all staff), `HRTOTLT` (grand-total headcount). **Admin** = STAFFCAT **1300 (Management)**; **faculty** = STAFFCAT **1210 (Instructional staff)**, both at FTPT=1. Denominator = EFIA 12-month FTE (reused from Source C / pulled here).
+- **Coverage:** U.S. institutions, collection years 2012-13 → 2021-22 (2013, 2016, 2019, 2022)
+- **Notes:** The most intuitive "bloat" proxy. **⭐ HARD series break at 2012-13:** IPEDS replaced the old primary-function / EEO occupational-activity categories with **2010-SOC-based** categories effective the 2012-13 collection, so this series is clean only **from 2012-13 forward**; NO pre-2012 crosswalk is attempted. Admin/faculty aggregation happens in 02-clean.
+- **Retrieved:** 2026-10
+
+> **⭐ Honest-framing note (Suspicion 2).** The spending-mix data (Delta + IPEDS
+> tail) shows **non-instructional** spending (student services + academic support
+> + institutional support) grew as a share of core spending while instruction's
+> share fell — but **institutional support (admin) ALONE is roughly flat**. So the
+> defensible finding is *"non-instructional spending outgrew instruction,"* **not**
+> *"administrators alone exploded"* (consistent with Kelchen's and ACTA's IPEDS
+> analyses). On the HEADCOUNT proxy (IPEDS HR), administrator headcount did outpace
+> faculty and enrollment 2013→present — a complementary, more quotable cut, not a
+> contradiction (headcount ≠ share of dollars). Charts carry this nuance explicitly.
 
 ---
 

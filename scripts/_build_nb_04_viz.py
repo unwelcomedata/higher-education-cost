@@ -134,6 +134,11 @@ REQUIRED_CHART_TABLES = [
     "chart_admin_per_fte_by_state",
     "chart_admin_per_fte_by_state_top_bottom",
     "chart_tuition_vs_cpi",
+    # REFRAME EXPANSION — new chart tables consumed by the N1-N4 charts below.
+    "chart_tuition_longrun",
+    "chart_spending_mix",
+    "chart_staff_indexed",
+    "chart_admin_faculty_ratio",
 ]
 missing_files = [t for t in REQUIRED_CHART_TABLES if not (PROCESSED / f"{t}.parquet").exists()]
 assert not missing_files, f"Stage-03 processed tables missing: {missing_files} — run 03-prepare first."
@@ -889,6 +894,310 @@ show(img)
 """
 )
 
+# ===========================================================================
+# REFRAME EXPANSION — new exploration charts (N1–N4) from Sources A–D
+# ===========================================================================
+md(
+    r"""
+---
+
+# ⭐ REFRAME EXPANSION — deeper cuts from the four new sources
+
+Everything above (charts 1–5b and R1–R3) is preserved unchanged. The charts below
+(**N1–N4**) are the NEW exploration from the four sources ingested this pass:
+the deep tuition history (NCES 330.10), the long spending-mix (Delta Cost Project
+1987-2012 + raw-IPEDS tail), and the admin-vs-faculty headcount (IPEDS HR). They
+consume the chart-ready tables `03-prepare` built — read-only; no `chart_*` table
+is built here.
+
+**ALL N-charts carry DESCRIPTIVE titles** (the one provocative title, "Big
+Education", is reserved for the R1 lead only). They answer Suspicion 2 (is the
+cost rise driven by administration?) **honestly** — the data says *non-
+instructional* spending outgrew instruction, NOT "administrators alone exploded,"
+and that nuance IS the finding.
+"""
+)
+
+code(
+    r"""
+# Confirm the expansion chart tables are present (03 built them), read-only.
+for t in ["chart_tuition_longrun", "chart_spending_mix", "chart_staff_indexed",
+          "chart_admin_faculty_ratio"]:
+    assert (PROCESSED / f"{t}.parquet").exists(), f"{t} missing — run 03-prepare first."
+    n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    assert n > 0, f"{t} is empty."
+    print(f"OK  {t:<28} rows={n}")
+TUI_BASE = int(con.execute("SELECT MAX(base_year) FROM chart_tuition_longrun").fetchone()[0])
+TUI_LAST = int(con.execute("SELECT MAX(year_start) FROM chart_tuition_longrun").fetchone()[0])
+MIX_Y0 = int(con.execute("SELECT MIN(year) FROM chart_spending_mix").fetchone()[0])
+MIX_Y1 = int(con.execute("SELECT MAX(year) FROM chart_spending_mix").fetchone()[0])
+HR_Y0 = int(con.execute("SELECT MIN(year) FROM chart_staff_indexed").fetchone()[0])
+HR_Y1 = int(con.execute("SELECT MAX(year) FROM chart_staff_indexed").fetchone()[0])
+print(f"tuition {min(1963, TUI_LAST)}-{TUI_LAST} (constant {TUI_BASE}-$); "
+      f"spending-mix {MIX_Y0}-{MIX_Y1}; HR {HR_Y0}-{HR_Y1}")
+"""
+)
+
+# --------------------------------------------------------------------------- N1
+md(
+    r"""
+## N1 — Published tuition & fees, 1963-64 → latest, constant dollars  *(deep skyrocket, multi-line)*
+
+The long view of the owner thesis: real (inflation-adjusted) published
+undergraduate tuition & fees since 1963-64, one line per control (all / public /
+private), 4-year institutions, in constant NCES dollars. This is the decades-long
+climb the CPI index chart (R1) implies, now in actual dollars.
+
+*Source: `chart_tuition_longrun` (consumed read-only; constant-$ tuition&fees,
+4-year, by control). NCES Digest Table 330.10. National averages, published
+(sticker) price, not net-of-aid; constant dollars use CPI-U All-Items.*
+"""
+)
+
+code(
+    r"""
+d_n1 = con.execute(
+    "SELECT year_start, control, value_constant FROM chart_tuition_longrun "
+    "WHERE level = '4-year' ORDER BY year_start"
+).df()
+wide_n1 = d_n1.pivot_table(index="year_start", columns="control",
+                           values="value_constant").reset_index()
+N1_COLORS = {"all": c("gold"), "public": c("teal"), "private": c("navy")}
+N1_LABELS = {"all": "All institutions", "public": "Public", "private": "Private"}
+order_n1 = ["private", "all", "public"]  # private highest -> public lowest at the right edge
+series_n1 = [{"col": k, "label": N1_LABELS[k], "color": N1_COLORS[k]} for k in order_n1]
+
+img = cf._render_line(
+    {
+        "table": wide_n1[["year_start"] + order_n1],
+        "x_col": "year_start",
+        "series": series_n1,
+        "x_axis_label": "Academic year (start)",
+        "y_axis_label": f"Tuition & fees (constant {TUI_BASE}-$)",
+        "y_min": 0,
+        "markers": False,
+        "label_last": True,
+        "legend": True,
+        "x_tick_step": 10,
+        "y_fmt": (lambda v: f"${v:,.0f}"),
+        "title": f"Published undergraduate tuition & fees, 1963\u201364 to {TUI_LAST}\u2013{str(TUI_LAST+1)[-2:]}",
+        "subtitle": f"NCES Digest Table 330.10. Constant {TUI_BASE}-{str(TUI_BASE+1)[-2:]} dollars "
+                    f"(CPI-U All-Items); 4-year institutions by control. Published (sticker) price.",
+    },
+    None,
+)
+show(img)
+
+pub = d_n1[d_n1.control == "public"].sort_values("year_start")
+print(f"Public 4-yr constant-${TUI_BASE} tuition&fees: "
+      f"1963 ${float(pub.iloc[0].value_constant):,.0f} -> {TUI_LAST} ${float(pub.iloc[-1].value_constant):,.0f} "
+      f"({float(pub.iloc[-1].value_constant)/float(pub.iloc[0].value_constant):.1f}x real)")
+"""
+)
+
+# --------------------------------------------------------------------------- N2
+md(
+    r"""
+## N2 — Where the money goes: spending mix, 1987 → latest  *(multi-line share + slopegraph endpoints)*
+
+The admin-driver question, answered HONESTLY. Two renders of the same
+`chart_spending_mix` data (national SHARE of core functional spending): a
+multi-line showing the full 1987→latest path, and a slopegraph of the 1987-vs-
+latest endpoints (the owner's established slopegraph preference). The four
+functions are **instruction** vs the three non-instructional ones
+(**institutional support = admin**, **academic support**, **student services**).
+
+**⭐ The honest story (read the slopes):** instruction's share FELL while the
+NON-INSTRUCTIONAL functions rose — but **institutional support (admin) alone is
+roughly FLAT**; the growth is in student services + academic support. So the
+defensible headline is "non-instructional spending outgrew instruction," NOT
+"administrators alone exploded." That institutional-support-is-flat nuance is
+itself a finding.
+
+*Source: `chart_spending_mix` (consumed read-only; national share by function).
+NCES Delta Cost Project (1987-2012) + raw IPEDS Finance (2013+); **seam at 2012**;
+"admin" = institutional support only; Delta is a derived product (Jaquette-Parra);
+GASB isolates O&M while FASB distributes it.*
+"""
+)
+
+code(
+    r"""
+d_n2 = con.execute(
+    "SELECT year, function, share FROM chart_spending_mix ORDER BY year"
+).df()
+FUNC_N2 = {
+    "instruction": "Instruction",
+    "institutional_support": "Inst. support (admin)",
+    "academic_support": "Academic support",
+    "student_services": "Student services",
+}
+F2_COLORS = {
+    "Instruction": c("teal"),
+    "Inst. support (admin)": c("spice"),
+    "Academic support": c("navy"),
+    "Student services": c("gold"),
+}
+d_n2["label"] = d_n2["function"].map(FUNC_N2)
+d_n2["pct"] = d_n2["share"] * 100
+wide_n2 = d_n2.pivot_table(index="year", columns="label", values="pct").reset_index()
+order_n2 = ["Instruction", "Inst. support (admin)", "Academic support", "Student services"]
+series_n2 = [{"col": s, "label": s, "color": F2_COLORS[s]} for s in order_n2]
+
+img = cf._render_line(
+    {
+        "table": wide_n2[["year"] + order_n2],
+        "x_col": "year",
+        "series": series_n2,
+        "x_axis_label": "Year",
+        "y_axis_label": "Share of core spending (%)",
+        "y_min": 0,
+        "markers": False,
+        "label_last": True,
+        "legend": True,
+        "x_tick_step": 5,
+        "y_fmt": (lambda v: f"{v:.0f}%"),
+        "title": f"Share of core spending by function, {MIX_Y0} to {MIX_Y1}",
+        "subtitle": f"NCES Delta Cost Project ({MIX_Y0}\u20132012) + IPEDS Finance (2013\u2013{MIX_Y1}), "
+                    f"national. Admin = institutional support only. Seam at 2012.",
+    },
+    None,
+)
+show(img)
+"""
+)
+
+code(
+    r"""
+# Same data as an endpoints slopegraph (1987 vs latest) — the owner's preferred cut.
+ends_n2 = d_n2[d_n2.year.isin([MIX_Y0, MIX_Y1])]
+wide_slope = ends_n2.pivot_table(index="label", columns="year", values="pct").reset_index()
+wide_slope = wide_slope.rename(columns={MIX_Y0: "y0", MIX_Y1: "y1"})[["label", "y0", "y1"]]
+print(wide_slope.to_string(index=False))
+
+cf.render_chart({
+    "type": "slopegraph",
+    "table": wide_slope,
+    "label_col": "label",
+    "period_cols": ["y0", "y1"],
+    "period_labels": [str(MIX_Y0), str(MIX_Y1)],
+    "value_fmt": (lambda v: f"{v:.1f}%"),
+    "series_colors": F2_COLORS,
+    "title": f"Core spending mix by function, {MIX_Y0} vs {MIX_Y1}",
+    "subtitle": "Share of core functional spending, national. Instruction fell; non-instructional rose "
+                "\u2014 but institutional support (admin) alone is roughly flat.",
+})
+
+# Honest-nuance printout.
+piv = d_n2.pivot_table(index="year", columns="label", values="pct")
+noninstr0 = piv.loc[MIX_Y0, ["Inst. support (admin)", "Academic support", "Student services"]].sum()
+noninstr1 = piv.loc[MIX_Y1, ["Inst. support (admin)", "Academic support", "Student services"]].sum()
+print(f"\nInstruction share : {piv.loc[MIX_Y0,'Instruction']:.1f}% -> {piv.loc[MIX_Y1,'Instruction']:.1f}%")
+print(f"Non-instructional : {noninstr0:.1f}% -> {noninstr1:.1f}%")
+print(f"Admin ALONE       : {piv.loc[MIX_Y0,'Inst. support (admin)']:.1f}% -> "
+      f"{piv.loc[MIX_Y1,'Inst. support (admin)']:.1f}%  (roughly flat \u2014 the nuance)")
+"""
+)
+
+# --------------------------------------------------------------------------- N3
+md(
+    r"""
+## N3 — Administrators, faculty, and enrollment since 2013, indexed  *(multi-line, 2013 = 100)*
+
+The intuitive "bloat" proxy: headcount of **administrators** (IPEDS HR Management)
+vs **faculty** (Instructional staff) vs **enrollment** (12-month FTE), each indexed
+to 100 at 2013. If the admin line pulls above faculty and enrollment, administrative
+staffing grew faster than the teaching workforce and the student body.
+
+> **⭐ Footnote (required):** IPEDS replaced its staff occupational categories in
+> 2012-13 (2010-SOC); this series is shown **from 2013 only** and is NOT comparable
+> to earlier IPEDS staff categories.
+
+*Source: `chart_staff_indexed` (consumed read-only). IPEDS Human Resources
+(Management vs Instructional staff headcount) + 12-month FTE; 2013 = 100.*
+"""
+)
+
+code(
+    r"""
+d_n3 = con.execute(
+    "SELECT year, series, index_base FROM chart_staff_indexed ORDER BY year"
+).df()
+N3_LABELS = {"admin": "Administrators (Management)", "faculty": "Faculty (Instructional)",
+             "enrollment": "Enrollment (12-mo FTE)"}
+N3_COLORS = {"Administrators (Management)": c("spice"), "Faculty (Instructional)": c("teal"),
+             "Enrollment (12-mo FTE)": c("gray")}
+d_n3["label"] = d_n3["series"].map(N3_LABELS)
+wide_n3 = d_n3.pivot_table(index="year", columns="label", values="index_base").reset_index()
+order_n3 = ["Administrators (Management)", "Faculty (Instructional)", "Enrollment (12-mo FTE)"]
+series_n3 = [{"col": s, "label": s, "color": N3_COLORS[s]} for s in order_n3]
+
+img = cf._render_line(
+    {
+        "table": wide_n3[["year"] + order_n3],
+        "x_col": "year",
+        "series": series_n3,
+        "x_axis_label": "Year",
+        "y_axis_label": "Index (2013 = 100)",
+        "markers": True,
+        "label_last": True,
+        "legend": True,
+        "x_tick_step": 3,
+        "y_fmt": (lambda v: f"{v:.0f}"),
+        "title": f"Administrator, faculty, and enrollment growth since 2013 (indexed)",
+        "subtitle": "IPEDS Human Resources + 12-month FTE, national; 2013 = 100. IPEDS replaced staff "
+                    "occupational categories in 2012-13 (2010-SOC) \u2014 series shown from 2013 only.",
+    },
+    None,
+)
+show(img)
+
+ip3 = d_n3.pivot_table(index="year", columns="series", values="index_base")
+yl = int(ip3.index.max())
+print(f"At {yl} (2013=100): admin={ip3.loc[yl,'admin']:.1f}, faculty={ip3.loc[yl,'faculty']:.1f}, "
+      f"enrollment={ip3.loc[yl,'enrollment']:.1f}")
+"""
+)
+
+# --------------------------------------------------------------------------- N4
+md(
+    r"""
+## N4 — Administrators per 100 faculty, 2013 vs latest  *(then-vs-now, lollipop)*
+
+The quotable one-number companion to N3: how many administrators (Management) per
+100 faculty (Instructional staff), first HR year vs latest. Same 2012-13 SOC-break
+footnote.
+
+*Source: `chart_admin_faculty_ratio` (consumed read-only). IPEDS Human Resources.*
+"""
+)
+
+code(
+    r"""
+d_n4 = con.execute(
+    "SELECT year, admin_per_100_faculty FROM chart_admin_faculty_ratio ORDER BY year"
+).df()
+d_n4["label"] = d_n4["year"].astype(str)
+print(d_n4.to_string(index=False))
+
+img = cf._render_lollipop(
+    {
+        "table": d_n4[["label", "admin_per_100_faculty"]],
+        "category_col": "label",
+        "value_col": "admin_per_100_faculty",
+        "value_fmt": (lambda v: f"{v:.1f}"),
+        "dot_color": c("spice"),
+        "legend": False,
+        "title": "Administrators per 100 faculty, 2013 vs latest",
+        "subtitle": "IPEDS Human Resources (Management staff per 100 instructional staff). "
+                    "Series clean from 2012-13 (2010-SOC categories) only.",
+    },
+    None,
+)
+show(img)
+"""
+)
+
 # ---------------------------------------------------------------------------
 md(
     """
@@ -950,8 +1259,48 @@ These are exploratory framings for owner review — **not** final social charts.
   without recentring. (Hospital services shows a larger raw % but is correctly
   excluded from the 1979 headline — its CPI series only starts 1996.)
 - These confirm the reframe's Suspicion 1 (relative inflation) is a strong,
-  defensible headline. Suspicion 2 (is the driver admin vs instruction) is a
-  LATER ingest (Delta Cost Project + IPEDS HR) — not built in this stage.
+  defensible headline. Suspicion 2 (is the driver admin vs instruction) is now
+  built below (N1–N4) from the Delta Cost Project + IPEDS HR ingest.
+
+---
+
+### ⭐ REFRAME EXPANSION takeaways (N1–N4 — the new honest findings for owner review)
+
+The four new sources answer the "how dramatic is the long tuition climb?" and
+"is the driver administration?" questions. Headline numbers (exact figures printed
+by the cells above):
+
+- **N1 — deep tuition skyrocket (NCES 330.10, constant dollars):** real published
+  tuition & fees roughly **4× since 1963-64** at public 4-year institutions
+  (≈ $2,440 → ≈ $9,900 in constant 2023-$). Private rose even higher in level.
+  This is the decades-long climb R1 shows as a CPI index, now in actual dollars —
+  dramatic, and the longest view in the project.
+- **N2 — spending mix, 1987 → latest (Delta + IPEDS tail) — ⭐ the load-bearing
+  honest nuance:** instruction's SHARE of core spending **FELL** (~49% → ~43%)
+  while **non-instructional** spending (student services + academic support +
+  institutional support) **ROSE** (~33% → ~37%). **BUT institutional support
+  (admin) ALONE is roughly FLAT** (~15% → ~15%); the growth is in **student
+  services** (+~2.5 pp) and **academic support** (+~1.7 pp). So the defensible
+  story is **"non-instructional spending outgrew instruction," NOT "administrators
+  alone exploded."** The admin-is-flat result is itself a finding and is weaker
+  than the owner's prior — say so, don't overclaim.
+- **N3 — admin vs faculty vs enrollment, indexed (IPEDS HR, 2013 = 100):** on the
+  HEADCOUNT proxy, administrators (Management) **did** outpace both — by the latest
+  year admin ≈ **108** vs faculty ≈ **95** vs enrollment ≈ **88** (2013 = 100). So
+  the intuitive "more administrators per student/teacher" reading holds on
+  headcount even though admin SPENDING share (N2) is flat — a genuine, more
+  quotable complement, NOT a contradiction (headcount ≠ share of dollars).
+- **N4 — administrators per 100 faculty, then vs now:** ≈ **17.6 (2013) → ≈ 20.1
+  (latest)** — the same N3 story as a single quotable ratio.
+- **Caveats to carry (do NOT drop):** N1 is national-average sticker price, not
+  net-of-aid, constant-$ via CPI-U All-Items. N2 has a **2012 seam** (Delta ends
+  2011-12, raw IPEDS after), Delta is a derived product (Jaquette-Parra), and
+  "admin" = institutional support only. N3/N4 are clean only from **2012-13**
+  (the 2010-SOC category break) — no pre-2012 comparison.
+- **For the owner to pick (NOT pre-picked here):** candidate additional social
+  charts are N1 (deep tuition line), N2 (spending-mix slopegraph or line — honestly
+  framed), and N3 (admin-vs-faculty-vs-enrollment indexed). The honest framing of
+  N2 is a feature: it is more credible precisely because it does not overclaim.
 """
 )
 

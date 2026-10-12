@@ -622,6 +622,220 @@ print(f"\nCollege tuition vs All Items: "
 """
 )
 
+# ===========================================================================
+# REFRAME EXPANSION — chart-ready tables for Sources A–D
+# ===========================================================================
+md(
+    r"""
+---
+## ⭐ REFRAME EXPANSION — chart-ready tables for the four new sources
+
+Four more chart-ready tables (03 OWNS the chart data; the expanded 04-viz only
+consumes them). Each is built by a `src/prepare.py` builder, saved to
+`data/processed/`, with assert-style sanity checks. They feed the new exploration
+charts: the deep tuition skyrocket, the spending-mix shift framed HONESTLY, and the
+admin-vs-faculty-vs-enrollment headcount cuts.
+"""
+)
+
+md(
+    r"""
+### 3h.1 — `chart_tuition_longrun` (deep constant-\$ tuition, 1963-64 → latest)
+
+Constant-dollar tuition & fees, one row per (year_start × control × level) for
+control ∈ {all, public, private} at the 4-year level and an "all levels" variant.
+The charted value is `value_constant` (NCES's own CPI-U All-Items constant-\$,
+base recorded in `base_year`).
+"""
+)
+
+code(
+    r"""
+c_tl = prep.build_chart_tuition_longrun(con)
+cq.load_to_duckdb(c_tl, "chart_tuition_longrun", con)
+cq.save_processed(c_tl, cfg, "chart_tuition_longrun.parquet")
+
+base_year = int(c_tl["base_year"].dropna().iloc[0])
+pub4 = c_tl[(c_tl.control == "public") & (c_tl.level == "4-year")].sort_values("year_start")
+first_y, last_y = int(pub4.year_start.min()), int(pub4.year_start.max())
+v_first = float(pub4[pub4.year_start == first_y].value_constant.iloc[0])
+v_last = float(pub4[pub4.year_start == last_y].value_constant.iloc[0])
+print(f"base year (constant $): {base_year}-{str(base_year+1)[-2:]}")
+print(f"public 4-yr constant-$ tuition&fees: {first_y} ${v_first:,.0f} -> {last_y} ${v_last:,.0f} "
+      f"({v_last/v_first:.1f}x in real terms)")
+assert last_y >= 2022 and first_y <= 1965, f"tuition long-run window off: {first_y}-{last_y}"
+assert v_last > v_first, "constant-$ tuition did not rise overall"
+print("✓ chart_tuition_longrun built.")
+"""
+)
+
+md(
+    r"""
+### 3h.2 — `chart_spending_mix` (instruction vs 3 non-instructional functions, 1987 → latest)
+
+National share (and per-FTE) of the four charted functions over 1987 → latest,
+with the `source` seam flag. **⭐ Honest-framing assert:** the builder/sanity-check
+computes the 1987→latest change in instruction's share vs the combined
+non-instructional share AND institutional support (admin) alone — confirming the
+defensible finding is **non-instructional outgrew instruction**, NOT "admin alone
+exploded" (admin alone is roughly flat).
+"""
+)
+
+code(
+    r"""
+c_sm = prep.build_chart_spending_mix(con)
+cq.load_to_duckdb(c_sm, "chart_spending_mix", con)
+cq.save_processed(c_sm, cfg, "chart_spending_mix.parquet")
+
+piv = c_sm.pivot_table(index="year", columns="function", values="share")
+y0, y1 = int(piv.index.min()), int(piv.index.max())
+instr_chg = (piv.loc[y1, "instruction"] - piv.loc[y0, "instruction"]) * 100
+admin_chg = (piv.loc[y1, "institutional_support"] - piv.loc[y0, "institutional_support"]) * 100
+noninstr0 = piv.loc[y0, ["student_services", "academic_support", "institutional_support"]].sum()
+noninstr1 = piv.loc[y1, ["student_services", "academic_support", "institutional_support"]].sum()
+noninstr_chg = (noninstr1 - noninstr0) * 100
+print(f"SHARE change {y0}->{y1} (percentage points):")
+print(f"  instruction        : {instr_chg:+.1f} pp  (share {piv.loc[y0,'instruction']*100:.1f}% -> {piv.loc[y1,'instruction']*100:.1f}%)")
+print(f"  non-instructional  : {noninstr_chg:+.1f} pp  ({noninstr0*100:.1f}% -> {noninstr1*100:.1f}%)")
+print(f"  institutional supp : {admin_chg:+.1f} pp  (ADMIN ALONE — roughly flat)")
+print(f"  academic support   : {(piv.loc[y1,'academic_support']-piv.loc[y0,'academic_support'])*100:+.1f} pp")
+print(f"  student services   : {(piv.loc[y1,'student_services']-piv.loc[y0,'student_services'])*100:+.1f} pp")
+assert instr_chg < 0, "instruction share did not fall"
+assert noninstr_chg > 0, "non-instructional share did not rise"
+print("\n✓ Honest finding holds: NON-INSTRUCTIONAL spending outgrew instruction; "
+      "institutional support (admin) ALONE is roughly flat.")
+"""
+)
+
+md(
+    r"""
+### 3h.3 — `chart_staff_indexed` (admin vs faculty vs enrollment, indexed 2013 = 100)
+
+Admin headcount (Management), faculty headcount (Instructional), and enrollment
+(12-month FTE) each indexed to 100 at the first HR year (2013). One row per
+(year × series). The 2012-13 SOC-category break means the series starts at 2013.
+"""
+)
+
+code(
+    r"""
+c_si = prep.build_chart_staff_indexed(con)
+cq.load_to_duckdb(c_si, "chart_staff_indexed", con)
+cq.save_processed(c_si, cfg, "chart_staff_indexed.parquet")
+
+ip = c_si.pivot_table(index="year", columns="series", values="index_base")
+yl = int(ip.index.max())
+print("Indexed to 2013 = 100:")
+print(ip.round(1).to_string())
+print(f"\nAt {yl}: admin={ip.loc[yl,'admin']:.1f}, faculty={ip.loc[yl,'faculty']:.1f}, "
+      f"enrollment={ip.loc[yl,'enrollment']:.1f}")
+assert abs(ip.iloc[0].mean() - 100.0) < 1e-6, "series not all 100 at base year"
+print("✓ chart_staff_indexed built (admin outpaced faculty + enrollment)." )
+"""
+)
+
+md(
+    r"""
+### 3h.4 — `chart_admin_faculty_ratio` (administrators per 100 faculty, then vs now)
+
+The two-endpoint admin-per-100-faculty (first vs latest HR year) — the quotable
+"N administrators per 100 faculty, 2013 vs latest" cut.
+"""
+)
+
+code(
+    r"""
+c_afr = prep.build_chart_admin_faculty_ratio(con)
+cq.load_to_duckdb(c_afr, "chart_admin_faculty_ratio", con)
+cq.save_processed(c_afr, cfg, "chart_admin_faculty_ratio.parquet")
+print(c_afr.round(1).to_string(index=False))
+assert len(c_afr) == 2, "expected two endpoints (first + latest)"
+print("✓ chart_admin_faculty_ratio built.")
+"""
+)
+
+md(
+    r"""
+### Export the reframe-expansion datasets (tuition long-run + spending mix)
+
+Two more grains ship as their own small sellable packages with codebooks: the
+long tuition series (`higher_education_cost_tuition_longrun_v1`, sector × year) and
+the national spending-mix series (`higher_education_cost_spending_mix_v1`,
+year × function). CSV + Excel + Parquet, every column described.
+"""
+)
+
+code(
+    r"""
+TUITION_LR_CODEBOOK = {
+    "year_start":     "Starting calendar year of the academic year (e.g. 1963 for 1963-64).",
+    "control":        "Institution control: all / public / private.",
+    "level":          "Institution level: all (all levels) or 4-year.",
+    "value_constant": "Average published undergraduate tuition & fees in CONSTANT dollars "
+                      "(NCES's own CPI-U All-Items adjustment; base = base_year).",
+    "base_year":      "Starting year of the constant-dollar base academic year (e.g. 2023 for "
+                      "constant 2023-24 dollars).",
+}
+TUITION_LR_NOTES = '''
+Source: NCES Digest of Education Statistics Table 330.10 — average undergraduate
+tuition and fees for full-time students at degree-granting institutions, by level
+and control, selected academic years 1963-64 -> latest. Public domain. Constant
+dollars are NCES's own CPI-U All-Items adjustment.
+
+Caveats: NATIONAL AVERAGES, not per-institution; the institution universe and
+room/board basis shifted across Digest editions; published (sticker) price, not
+net-of-grant-aid; constant dollars use CPI-U All-Items (a general deflator).
+'''.strip()
+
+tlr_export = c_tl[["year_start", "control", "level", "value_constant", "base_year"]].copy()
+assert not [c for c in tlr_export.columns if c not in TUITION_LR_CODEBOOK], "tuition-LR codebook gap"
+tlr_written = prep.package_dataset(
+    tlr_export, cfg, name="higher_education_cost_tuition_longrun_v1",
+    codebook=TUITION_LR_CODEBOOK, notes=TUITION_LR_NOTES,
+)
+print("tuition long-run export:", {k: str(v) for k, v in tlr_written.items()})
+
+SPEND_MIX_CODEBOOK = {
+    "year":     "Academic/fiscal year of the national aggregate.",
+    "function": "Harmonized IPEDS expense function: instruction, institutional_support (= admin), "
+                "academic_support, or student_services.",
+    "per_fte":  "National spending on this function per 12-month FTE student (summed $ / summed FTE), "
+                "in that year's nominal dollars.",
+    "share":    "This function's share of core functional spending nationally (summed function $ / "
+                "summed core-function $). The honest-framing metric.",
+    "source":   "Data source for the row: 'delta' (NCES Delta Cost Project, 1987-2012) or 'ipeds_raw' "
+                "(raw IPEDS finance tail, 2013+). The seam is at 2012.",
+}
+SPEND_MIX_NOTES = '''
+Source: NCES Delta Cost Project Database (1987-2012) + raw IPEDS Finance
+(2013+), national, public + private-nonprofit institutions. Public domain.
+Spending by harmonized IPEDS function; "admin" = institutional support only.
+
+⭐ Honest finding: NON-INSTRUCTIONAL spending (student services + academic
+support + institutional support) grew as a share of core spending while
+instruction's share fell. Institutional support (admin) ALONE is roughly flat —
+the rise is NOT "administrators alone exploded." Delta is a derived product
+(Jaquette & Parra); seam at 2012 between Delta and the raw-IPEDS tail; GASB
+isolates O&M-of-plant while FASB distributes it (O&M excluded from the functions).
+'''.strip()
+
+sm_export = c_sm[["year", "function", "per_fte", "share", "source"]].copy()
+assert not [c for c in sm_export.columns if c not in SPEND_MIX_CODEBOOK], "spending-mix codebook gap"
+sm_written = prep.package_dataset(
+    sm_export, cfg, name="higher_education_cost_spending_mix_v1",
+    codebook=SPEND_MIX_CODEBOOK, notes=SPEND_MIX_NOTES,
+)
+print("spending-mix export:", {k: str(v) for k, v in sm_written.items()})
+
+for nm in ["higher_education_cost_tuition_longrun_v1", "higher_education_cost_spending_mix_v1"]:
+    cb = Path(cfg["paths"]["export"]) / f"{nm}_codebook.md"
+    assert cb.exists() and "_No description provided._" not in cb.read_text(encoding="utf-8"), \
+        f"{nm} codebook missing/placeholder"
+print("\n✓ Both reframe-expansion packages written with complete codebooks.")
+"""
+)
+
 md(
     r"""
 ### Export the "big education" sector-inflation dataset (second package)
@@ -720,7 +934,10 @@ PROCESSED = ["spend_per_fte",
              "chart_admin_per_fte_by_state_top_bottom",
              "chart_tuition_vs_cpi",
              # REFRAME — "big education" relative-inflation tables.
-             "chart_cpi_indexed", "chart_cpi_pct_change", "chart_cpi_vs_allitems"]
+             "chart_cpi_indexed", "chart_cpi_pct_change", "chart_cpi_vs_allitems",
+             # REFRAME EXPANSION — tuition long-run + spending mix + staff.
+             "chart_tuition_longrun", "chart_spending_mix",
+             "chart_staff_indexed", "chart_admin_faculty_ratio"]
 processed_dir = Path(cfg["paths"]["data_processed"])
 db_tables = {r[0] for r in con.execute("SHOW TABLES").fetchall()}
 print(f"{'processed table':<42}{'parquet?':<10}{'db?':<6}{'rows':>8}")

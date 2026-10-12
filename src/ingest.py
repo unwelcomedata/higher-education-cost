@@ -478,3 +478,204 @@ def fetch_bls_series(
                 }
             )
     return pd.DataFrame(records)
+
+
+# ---------------------------------------------------------------------------
+# REFRAME EXPANSION — long tuition history, Delta Cost Project, Delta/raw helpers
+# ---------------------------------------------------------------------------
+#
+# These support the second wave of sources ingested for the "big education"
+# reframe (SECTOR-COMPARISON-INVESTIGATION §3, HISTORICAL-DEPTH-INVESTIGATION):
+#   A. NCES Digest Table 330.10  — long tuition skyrocket 1963-64 -> latest.
+#   B. NCES Delta Cost Project DB — harmonized spending-by-function + FTE 1987-2012.
+# (Sources C — raw IPEDS finance tail — and D — IPEDS HR — reuse the existing
+# download_ipeds_survey()/read_ipeds_zip() helpers above; the modern finance
+# function-code schema (F1C*/F2E*) and ZIP pattern are unchanged post-2008
+# Aligned Form, confirmed per year in 01-ingest.)
+
+
+def download_nces_digest_xlsx(url: str, cfg: dict, dest_name: str, timeout: int = 60) -> Path:
+    """Download an NCES Digest of Education Statistics table as its Excel file, verbatim.
+
+    The Digest table HTML pages (e.g. dt24_330.10.asp) embed a wide multi-level
+    table that pandas.read_html cannot parse cleanly, but every table page offers a
+    clean companion `.xlsx` (link text "Download Excel") at a stable path:
+
+        https://nces.ed.gov/programs/digest/<edition>/tables/xls/tabn330.10.xlsx
+
+    This downloads that Excel verbatim into `data/raw/nces/<dest_name>` (the raw
+    artifact) and returns the path. Parsing into a tidy table happens in 02-clean —
+    nothing is transformed here.
+
+    Args:
+        url:       Full URL to the Digest table's companion .xlsx.
+        cfg:       Loaded config dict.
+        dest_name: Filename to save under data/raw/nces/ (e.g. "dt_330_10.xlsx").
+        timeout:   Request timeout in seconds.
+
+    Returns:
+        Path to the downloaded Excel in data/raw/nces/.
+    """
+    dest = raw_path(cfg, f"nces/{dest_name}")
+    time.sleep(1.5)  # polite rate limit (workspace rule >=1.0s)
+    download_file(url, dest, timeout=timeout)
+    return dest
+
+
+def read_nces_digest_tuition_longrun(xlsx_path: Path) -> pd.DataFrame:
+    """Parse NCES Digest Table 330.10 (.xlsx) into a tidy long tuition table.
+
+    Table 330.10 is "Average undergraduate tuition and fees and room and board
+    rates charged for full-time students in degree-granting postsecondary
+    institutions, by level and control of institution". The Excel layout
+    (confirmed for the d24 edition) is a single wide sheet:
+
+      - row 0  : title
+      - row 1  : dollar-basis groups — "Current dollars" (cols 1-12) and
+                 "Constant <base> dollars" (cols 13-24). The constant base year is
+                 read from this row's text (e.g. "Constant 2023-24 dollars").
+      - row 2  : cost-component groups, each spanning 3 columns — Total t/f/r/b,
+                 "Tuition and required fees", "Dormitory rooms", "Board".
+      - row 3  : level within each component — All institutions / 4-year / 2-year.
+      - row 4  : printed column numbers 1..25 (col 0 = the academic-year/control label).
+      - rows 5+: data, grouped into three CONTROL panels whose header rows carry a
+                 label in col 0 and nothing else: "All institutions",
+                 "Public institutions", "Private institutions". Within each panel,
+                 one row per selected academic year ("1963-64", "1968-69", ...).
+
+    Returns a tidy long frame — one row per
+    (academic_year × control × level × dollar_basis × cost_component) with a numeric
+    `value` and the constant-$ `base_year`. The raw .xlsx on disk is untouched.
+    """
+    raw = pd.read_excel(xlsx_path, header=None)
+
+    # Constant-$ base year from the row-1 "Constant <base> dollars" label.
+    base_year = None
+    for cell in raw.iloc[1].tolist():
+        s = str(cell)
+        if "Constant" in s:
+            import re as _re
+            m = _re.search(r"(\d{4})-\d{2}", s)
+            if m:
+                base_year = int(m.group(1))
+            break
+
+    # Column layout (0-indexed df columns): col 0 is the label.
+    # Current block : Total 1-3, Tuition&fees 4-6, Dorm 7-9, Board 10-12
+    # Constant block: Total 13-15, Tuition&fees 16-18, Dorm 19-21, Board 22-24
+    # Within each group of 3: All institutions / 4-year / 2-year.
+    components = [
+        ("total", 1, 13),
+        ("tuition_fees", 4, 16),
+        ("dorm", 7, 19),
+        ("board", 10, 22),
+    ]
+    levels = ["all", "4-year", "2-year"]
+
+    # Walk the rows: panel headers set the current control; year rows emit data.
+    panel_to_control = {
+        "all institutions": "all",
+        "public institutions": "public",
+        "private institutions": "private",
+    }
+    current_control: str | None = None
+    records: list[dict[str, Any]] = []
+
+    import re as _re
+    for i in range(5, raw.shape[0]):
+        label = str(raw.iloc[i, 0]).strip().replace("\n", " ")
+        if not label or label.lower() == "nan":
+            continue
+        key = label.lower()
+        if key in panel_to_control:
+            current_control = panel_to_control[key]
+            continue
+        # A year row looks like "1963-64" / "1999-2000" (optional footnote "\5\").
+        ym = _re.match(r"^(\d{4})-(\d{2,4})", label)
+        if not ym or current_control is None:
+            continue
+        year_start = int(ym.group(1))
+        academic_year = f"{ym.group(1)}-{ym.group(2)}"
+        for component, cur_col, const_col in components:
+            for lvl_offset, level in enumerate(levels):
+                for basis, base_col in (("current", cur_col), ("constant", const_col)):
+                    raw_val = raw.iloc[i, base_col + lvl_offset]
+                    sval = str(raw_val).replace("$", "").replace(",", "").strip()
+                    if sval in ("", "nan", "—", "-", "( )"):
+                        continue
+                    try:
+                        value = float(sval)
+                    except ValueError:
+                        continue
+                    records.append(
+                        {
+                            "academic_year": academic_year,
+                            "year_start": year_start,
+                            "control": current_control,
+                            "level": level,
+                            "dollar_basis": basis,
+                            "base_year": base_year if basis == "constant" else None,
+                            "cost_component": component,
+                            "value": value,
+                        }
+                    )
+    return pd.DataFrame(records)
+
+
+def download_delta_cost(cfg: dict, url: str, timeout: int = 900) -> Path:
+    """Download the NCES Delta Cost Project 1987-2012 CSV ZIP verbatim into data/raw/.
+
+    One large (~115 MB) zip at
+    http(s)://nces.ed.gov/ipeds/deltacostproject/download/IPEDS_Analytics_DCP_87_12_CSV.zip
+    holding two CSVs — `delta_public_87_99.csv` and `delta_public_00_12.csv` — of the
+    NCES-harmonized longitudinal IPEDS finance/enrollment/staffing panel (academic
+    years 1986-87 -> 2011-12). "public" names the public-RELEASE file, not public
+    institutions. The zip on disk is the untouched raw artifact; column-subset
+    loading happens in `read_delta_cost()`.
+
+    Returns the Path to the downloaded zip (data/raw/delta/...).
+    """
+    dest = raw_path(cfg, "delta/IPEDS_Analytics_DCP_87_12_CSV.zip")
+    if dest.exists() and dest.stat().st_size > 100_000_000:
+        return dest  # already fully downloaded (idempotent — skip the 115 MB pull)
+    time.sleep(1.5)
+    download_file(url, dest, timeout=timeout)
+    return dest
+
+
+# The Delta columns we actually need (subset of 974) — read ONLY these to keep
+# memory sane. Confirmed against the shipped CSV header (2026): the function
+# totals are the CFI-method "<fn>01" columns, FTE is the constructed 12-month
+# `fte12mn`, and `control` is 1=public / 2=private-nonprofit / 3=for-profit.
+DELTA_NEEDED_COLS = [
+    "unitid", "academicyear", "control", "sector",
+    "fte12mn", "fte_count",
+    "instruction01", "research01", "pubserv01",
+    "acadsupp01", "studserv01", "instsupp01",
+    "cpi_scalar_2012",
+]
+
+
+def read_delta_cost(zip_path: Path, needed_cols: list[str] | None = None) -> pd.DataFrame:
+    """Read the Delta Cost Project CSVs (both year spans) with a column subset.
+
+    The zip holds two CSVs (1987-99 and 2000-12); both are read with the SAME
+    column subset and concatenated into one long frame covering 1987-2012. The
+    full 974-column width is never materialised. Returns the untouched subset
+    (all harmonization already done by NCES; our 02-clean only tidies/filters).
+    """
+    cols = needed_cols or DELTA_NEEDED_COLS
+    frames = []
+    with zipfile.ZipFile(zip_path) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        for name in sorted(csv_names):
+            with zf.open(name) as fh:
+                # Read header first to intersect requested cols with what's present.
+                header = pd.read_csv(io.BytesIO(fh.read(1 << 20)), nrows=0,
+                                     encoding="latin-1").columns.tolist()
+            use = [c for c in cols if c in header]
+            with zf.open(name) as fh:
+                df = pd.read_csv(io.BytesIO(fh.read()), usecols=use,
+                                 encoding="latin-1", low_memory=False)
+            frames.append(df)
+    return pd.concat(frames, ignore_index=True)

@@ -566,3 +566,277 @@ def build_cpi_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     ORDER BY year
     """
     return run_sql(sql, con)
+
+
+# ===========================================================================
+# REFRAME EXPANSION — cleaning builders for Sources A–D (02-clean)
+# ===========================================================================
+#
+# Four more interim _clean tables, all DuckDB-SQL based:
+#   A. tuition_longrun_clean          — tidy long NCES 330.10 (already long in ingest).
+#   B. delta_spending_clean /         — Delta per-institution + national spending by
+#      delta_spending_national_clean    function, with per-FTE AND SHARES (1987-2012).
+#   C. finance_tail_clean /           — raw-IPEDS 2013-2021 harmonized onto Delta's
+#      spending_mix_clean               categories; stacked national 1987->latest series.
+#   D. hr_staff_clean /               — IPEDS HR admin (Management=STAFFCAT 1300) vs
+#      hr_staff_national_clean          faculty (Instructional=1210) headcount + FTE.
+#
+# ⭐ Honest framing enforced in the SHARE math: the comparable denominator is the
+# in-pipeline sum of the SAME core functions used elsewhere (instruction, research,
+# public_service, academic_support, student_services, institutional_support), so a
+# function's SHARE is "share of core functional spending". The finding the data
+# supports is "non-instructional (student services + academic support + institutional
+# support) outgrew instruction", NOT "administrators alone exploded" — institutional
+# support (admin) alone is roughly flat (see 03/04).
+
+# Delta CFI-method function column -> harmonized function name (same taxonomy as
+# the GASB/FASB crosswalk above, so the 1987-2012 Delta series and the 2013+ raw
+# tail stack onto identical category labels).
+DELTA_FUNCTION_COLS: dict[str, str] = {
+    "instruction01": "instruction",
+    "research01":    "research",
+    "pubserv01":     "public_service",
+    "acadsupp01":    "academic_support",
+    "studserv01":    "student_services",
+    "instsupp01":    "institutional_support",
+}
+# The core functions summed to form the SHARE denominator (identical everywhere).
+SPEND_CORE_FUNCTIONS = (
+    "instruction", "research", "public_service",
+    "academic_support", "student_services", "institutional_support",
+)
+
+
+def build_tuition_longrun_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """tuition_longrun_clean — tidy long NCES 330.10 (one row per year×control×level×basis×component).
+
+    nces_tuition_longrun_raw is already tidy-long from the ingest parser; this is a
+    light typing/validation pass (cast year_start/value/base_year to numeric, trim
+    the string dims). All cleaning stays in DuckDB.
+    """
+    sql = """
+    SELECT TRIM(academic_year)        AS academic_year,
+           TRY_CAST(year_start AS INTEGER) AS year_start,
+           LOWER(TRIM(control))       AS control,
+           LOWER(TRIM(level))         AS level,
+           LOWER(TRIM(dollar_basis))  AS dollar_basis,
+           TRY_CAST(base_year AS INTEGER)  AS base_year,
+           LOWER(TRIM(cost_component)) AS cost_component,
+           TRY_CAST(value AS DOUBLE)  AS value
+    FROM nces_tuition_longrun_raw
+    WHERE value IS NOT NULL
+    ORDER BY control, level, cost_component, dollar_basis, year_start
+    """
+    return run_sql(sql, con)
+
+
+def _delta_melt_sql() -> str:
+    """UNION-ALL melt of delta_cost_raw into the long function schema (public+private NP only)."""
+    parts = []
+    for col, fn in DELTA_FUNCTION_COLS.items():
+        parts.append(
+            f"SELECT TRY_CAST(unitid AS BIGINT) AS unitid, "
+            f"TRY_CAST(academicyear AS INTEGER) AS year, "
+            f"CASE control WHEN 1 THEN 'public' WHEN 2 THEN 'private_np' END AS control, "
+            f"'{fn}' AS function, "
+            f"TRY_CAST({col} AS DOUBLE) AS amount, "
+            f"TRY_CAST(fte12mn AS DOUBLE) AS fte_total "
+            f"FROM delta_cost_raw WHERE control IN (1, 2)"
+        )
+    return "\nUNION ALL\n".join(parts)
+
+
+def build_delta_spending_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """delta_spending_clean — Delta per-institution spending by function, 1987-2012.
+
+    One row per unitid × year × control × function, carrying nominal `amount`,
+    the institution's `fte_total` (Delta's constructed 12-month FTE), per-FTE
+    (`amount_per_fte`), and the within-institution SHARE of core functional
+    spending (`share`, denominator = sum over SPEND_CORE_FUNCTIONS for that
+    unit·year). For-profits are already dropped (control IN (1,2)). Rows with
+    null/0 FTE keep `amount` but get NULL per-FTE.
+    """
+    melt = _delta_melt_sql()
+    sql = f"""
+    WITH long AS ({melt}),
+    denom AS (
+        SELECT unitid, year, control, SUM(amount) AS core_total
+        FROM long GROUP BY unitid, year, control
+    )
+    SELECT l.unitid, l.year, l.control, l.function, l.amount, l.fte_total,
+           CASE WHEN l.fte_total IS NULL OR l.fte_total = 0 THEN NULL
+                ELSE l.amount / l.fte_total END AS amount_per_fte,
+           CASE WHEN d.core_total IS NULL OR d.core_total = 0 THEN NULL
+                ELSE l.amount / d.core_total END AS share
+    FROM long l
+    JOIN denom d USING (unitid, year, control)
+    WHERE l.control IS NOT NULL
+    ORDER BY l.unitid, l.year, l.function
+    """
+    return run_sql(sql, con)
+
+
+def _national_spending_sql(source_table: str, source_label: str) -> str:
+    """National per-year-per-function aggregate (summed-$ / summed-FTE and summed-share).
+
+    Share is computed as summed function $ / summed core $ across all institutions
+    (an institution-size-weighted national share) so the 1987-2012 Delta aggregate
+    and the 2013+ raw-tail aggregate stack onto one comparable national series.
+    """
+    core = ", ".join(f"'{f}'" for f in SPEND_CORE_FUNCTIONS)
+    return f"""
+    WITH tot AS (
+        SELECT year, function, SUM(amount) AS amount, SUM(fte_total) AS fte_total
+        FROM {source_table}
+        WHERE function IN ({core})
+        GROUP BY year, function
+    ),
+    core_by_year AS (
+        SELECT year, SUM(amount) AS core_total FROM tot GROUP BY year
+    )
+    SELECT t.year, t.function,
+           t.amount,
+           CASE WHEN t.fte_total > 0 THEN t.amount / t.fte_total END AS per_fte,
+           CASE WHEN c.core_total > 0 THEN t.amount / c.core_total END AS share,
+           '{source_label}' AS source
+    FROM tot t JOIN core_by_year c USING (year)
+    """
+
+
+def build_delta_spending_national_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """delta_spending_national_clean — one row per year×function, national, 1987-2012.
+
+    Enrollment-weighted (summed-$ / summed-FTE) per-FTE and national SHARE across
+    all public+private-nonprofit institutions. The trend backbone 1987->2012.
+    """
+    return run_sql(_national_spending_sql("delta_spending_clean", "delta"), con)
+
+
+def build_finance_tail_clean(
+    con: duckdb.DuckDBPyConnection,
+    years: list[int],
+    crosswalk: dict[str, tuple[str, str]],
+) -> pd.DataFrame:
+    """finance_tail_clean — raw-IPEDS 2013-2021 finance harmonized onto Delta categories.
+
+    For each supplied year, melt GASB (F1C*) + FASB (F2E*) function totals to the
+    shared long schema, tag control (public=GASB, private_np=FASB), join EFIA
+    12-month FTE (ipeds_fte_<yr>_raw: FTEUG + FTEGD), and compute per-FTE + the
+    within-institution SHARE of core functional spending — the SAME category
+    labels and denominator as the Delta series, so the two stack cleanly across
+    the 2012 seam.
+    """
+    core = ", ".join(f"'{f}'" for f in SPEND_CORE_FUNCTIONS)
+    year_blocks = []
+    for yr in years:
+        gasb_tbl = f"ipeds_finance_gasb_{yr}_raw"
+        fasb_tbl = f"ipeds_finance_fasb_{yr}_raw"
+        fte_tbl = f"ipeds_fte_{yr}_raw"
+        melts = []
+        for fn, (gcol, fcol) in crosswalk.items():
+            melts.append(
+                f"SELECT TRY_CAST(UNITID AS BIGINT) AS unitid, {yr} AS year, 'public' AS control, "
+                f"'{fn}' AS function, TRY_CAST({gcol} AS DOUBLE) AS amount FROM {gasb_tbl}"
+            )
+            melts.append(
+                f"SELECT TRY_CAST(UNITID AS BIGINT), {yr}, 'private_np', "
+                f"'{fn}', TRY_CAST({fcol} AS DOUBLE) FROM {fasb_tbl}"
+            )
+        melt_sql = "\nUNION ALL\n".join(melts)
+        year_blocks.append(
+            f"""
+        SELECT m.unitid, m.year, m.control, m.function, m.amount,
+               (COALESCE(TRY_CAST(e.FTEUG AS DOUBLE),0) + COALESCE(TRY_CAST(e.FTEGD AS DOUBLE),0)) AS fte_total
+        FROM ({melt_sql}) m
+        LEFT JOIN {fte_tbl} e ON m.unitid = TRY_CAST(e.UNITID AS BIGINT)
+        """
+        )
+    all_years = "\nUNION ALL\n".join(year_blocks)
+    sql = f"""
+    WITH long AS ({all_years}),
+    denom AS (
+        SELECT unitid, year, control, SUM(amount) FILTER (WHERE function IN ({core})) AS core_total
+        FROM long GROUP BY unitid, year, control
+    )
+    SELECT l.unitid, l.year, l.control, l.function, l.amount, l.fte_total,
+           CASE WHEN l.fte_total IS NULL OR l.fte_total = 0 THEN NULL
+                ELSE l.amount / l.fte_total END AS amount_per_fte,
+           CASE WHEN d.core_total IS NULL OR d.core_total = 0 THEN NULL
+                ELSE l.amount / d.core_total END AS share
+    FROM long l
+    JOIN denom d USING (unitid, year, control)
+    ORDER BY l.year, l.unitid, l.function
+    """
+    return run_sql(sql, con)
+
+
+def build_spending_mix_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """spending_mix_clean — the stacked national spending-by-function series, 1987 -> latest.
+
+    Delta national (1987-2012) UNION the raw-tail national (2013-latest), one row per
+    year × function with per_fte, share, and a `source` seam flag. This is the table
+    03's spending-mix chart consumes.
+    """
+    tail_national = _national_spending_sql("finance_tail_clean", "ipeds_raw")
+    # The raw-tail national block is a CTE (WITH ...) query, so it must be wrapped
+    # in parentheses on the right side of the UNION ALL.
+    sql = f"""
+    SELECT year, function, amount, per_fte, share, source
+    FROM delta_spending_national_clean
+    UNION ALL
+    SELECT year, function, amount, per_fte, share, source FROM (
+    {tail_national}
+    )
+    """
+    return run_sql(sql, con)
+
+
+def build_hr_staff_clean(
+    con: duckdb.DuckDBPyConnection,
+    years: list[int],
+) -> pd.DataFrame:
+    """hr_staff_clean — IPEDS HR admin vs faculty headcount + FTE, one row per unitid×year.
+
+    admin_headcount  = STAFFCAT 1300 (Management), FTPT=1 (all staff), HRTOTLT.
+    faculty_headcount = STAFFCAT 1210 (Instructional staff), FTPT=1, HRTOTLT.
+    fte_total        = EFIA 12-month FTE (FTEUG + FTEGD) for that year.
+    Clean window = 2012-13 SOC categories only (no pre-2012 crosswalk).
+    """
+    blocks = []
+    for yr in years:
+        hr_tbl = f"ipeds_hr_{yr}_raw"
+        fte_tbl = f"ipeds_fte_{yr}_raw"
+        blocks.append(
+            f"""
+        SELECT a.unitid, {yr} AS year, a.admin_headcount, f.faculty_headcount,
+               (COALESCE(TRY_CAST(e.FTEUG AS DOUBLE),0) + COALESCE(TRY_CAST(e.FTEGD AS DOUBLE),0)) AS fte_total
+        FROM (SELECT TRY_CAST(UNITID AS BIGINT) AS unitid,
+                     SUM(TRY_CAST(HRTOTLT AS DOUBLE)) AS admin_headcount
+              FROM {hr_tbl} WHERE STAFFCAT = 1300 AND FTPT = 1 GROUP BY UNITID) a
+        FULL OUTER JOIN (SELECT TRY_CAST(UNITID AS BIGINT) AS unitid,
+                     SUM(TRY_CAST(HRTOTLT AS DOUBLE)) AS faculty_headcount
+              FROM {hr_tbl} WHERE STAFFCAT = 1210 AND FTPT = 1 GROUP BY UNITID) f
+          ON a.unitid = f.unitid
+        LEFT JOIN {fte_tbl} e
+          ON COALESCE(a.unitid, f.unitid) = TRY_CAST(e.UNITID AS BIGINT)
+        """
+        )
+    sql = "\nUNION ALL\n".join(blocks)
+    # COALESCE the join key so a unit present in only one of admin/faculty still lands.
+    sql = sql.replace("SELECT a.unitid, ", "SELECT COALESCE(a.unitid, f.unitid) AS unitid, ")
+    return run_sql(f"SELECT * FROM ({sql}) ORDER BY year, unitid", con)
+
+
+def build_hr_staff_national_clean(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+    """hr_staff_national_clean — one row per year: summed admin, faculty, FTE + admin_per_100_faculty."""
+    sql = """
+    SELECT year,
+           SUM(admin_headcount)   AS admin_headcount,
+           SUM(faculty_headcount) AS faculty_headcount,
+           SUM(fte_total)         AS fte_total,
+           100.0 * SUM(admin_headcount) / NULLIF(SUM(faculty_headcount), 0) AS admin_per_100_faculty
+    FROM hr_staff_clean
+    GROUP BY year
+    ORDER BY year
+    """
+    return run_sql(sql, con)

@@ -689,6 +689,184 @@ print(f"✓ Deflator ready — 2012 dollars scale to 2022 by x{anchors[2022]/anc
 """
 )
 
+# ===========================================================================
+# REFRAME EXPANSION — clean Sources A–D into interim tables
+# ===========================================================================
+md(
+    r"""
+---
+# ⭐ REFRAME EXPANSION — clean the four new sources (A–D)
+
+Each new raw source (`nces_tuition_longrun_raw`, `delta_cost_raw`, the raw-IPEDS
+finance tail, the IPEDS HR files) is harmonized here into interim `_clean` tables,
+all in DuckDB SQL via `src/clean_quality.py` builders. Each passes
+`quality_report()` before `save_interim()`. **The spending series use SHARES of
+core functional spending with an identical in-pipeline denominator**, so the
+honest finding — *non-instructional spending outgrew instruction, NOT admin
+alone* — can be read straight from the clean tables.
+"""
+)
+
+# --------------------------------------------------------------------------- A
+md(
+    r"""
+## Step A — `tuition_longrun_clean` (deep tuition skyrocket, 1963-64 → latest)
+
+`nces_tuition_longrun_raw` is already tidy-long from the ingest parser; this is a
+light DuckDB typing/validation pass → one row per
+**(academic_year × control × level × dollar_basis × cost_component)** with numeric
+`value` and the constant-$ `base_year`. We assert the known anchors hold (public
+4-yr tuition&fees ≈ \$243 in 1963-64, ≈ \$9,750 in 2022-23).
+"""
+)
+
+code(
+    r"""
+tl = cq.build_tuition_longrun_clean(con)
+cq.quality_report(tl, "tuition_longrun_clean", con,
+                  required_columns=["year_start", "control", "value"], max_null_pct=0.6)
+cq.load_to_duckdb(tl, "tuition_longrun_clean", con)
+cq.save_interim(tl, cfg, "tuition_longrun_clean.parquet")
+
+base_year = int(tl["base_year"].dropna().iloc[0])
+print("constant-$ base year:", f"{base_year}-{str(base_year+1)[-2:]}")
+pub4 = tl[(tl.control == "public") & (tl.level == "4-year")
+          & (tl.cost_component == "tuition_fees") & (tl.dollar_basis == "current")]
+a1963 = float(pub4[pub4.year_start == 1963].value.iloc[0])
+a2022 = float(pub4[pub4.year_start == 2022].value.iloc[0])
+print(f"anchor — public 4-yr t&f current: 1963-64 ${a1963:,.0f} (≈243), 2022-23 ${a2022:,.0f} (≈9,750)")
+assert 230 <= a1963 <= 260, f"1963-64 anchor off: {a1963}"
+assert 9000 <= a2022 <= 10500, f"2022-23 anchor off: {a2022}"
+print("✓ tuition long-run anchors hold.")
+"""
+)
+
+# --------------------------------------------------------------------------- B
+md(
+    r"""
+## Step B — `delta_spending_clean` + `delta_spending_national_clean` (1987-2012)
+
+From `delta_cost_raw` (public + private-nonprofit only; for-profits dropped),
+build one row per **unitid × year × function** carrying nominal `amount`, Delta's
+constructed 12-month `fte_total`, `amount_per_fte`, and the within-institution
+**`share`** of core functional spending (denominator = sum over the six core
+functions, computed identically everywhere). Then a national aggregate
+(`delta_spending_national_clean`, one row per **year × function**) = summed-\$ /
+summed-FTE and summed-share — the 1987→2012 trend backbone.
+
+> Delta is a DERIVED product (Jaquette-Parra) and ends 2011-12 — SHARES are
+> preferred over absolute per-FTE where imputation risk is higher.
+"""
+)
+
+code(
+    r"""
+ds = cq.build_delta_spending_clean(con)
+cq.quality_report(ds, "delta_spending_clean", con,
+                  required_columns=["unitid", "year", "function", "amount"], max_null_pct=0.6)
+cq.load_to_duckdb(ds, "delta_spending_clean", con)
+cq.save_interim(ds, cfg, "delta_spending_clean.parquet")
+print("delta_spending_clean:", ds.shape, "years", int(ds.year.min()), "->", int(ds.year.max()))
+
+dn = cq.build_delta_spending_national_clean(con)
+cq.quality_report(dn, "delta_spending_national_clean", con,
+                  required_columns=["year", "function", "share"], max_null_pct=0.1)
+cq.load_to_duckdb(dn, "delta_spending_national_clean", con)
+cq.save_interim(dn, cfg, "delta_spending_national_clean.parquet")
+
+print("\nNational SHARE of core spending, 1987 vs 2012 (the honest nuance):")
+piv = dn.pivot_table(index="year", columns="function", values="share")
+piv["non_instruction"] = piv[["student_services", "academic_support", "institutional_support"]].sum(axis=1)
+print(piv.loc[[1987, 2012], ["instruction", "institutional_support", "academic_support",
+                             "student_services", "non_instruction"]].round(3).to_string())
+"""
+)
+
+# --------------------------------------------------------------------------- C
+md(
+    r"""
+## Step C — `finance_tail_clean` + `spending_mix_clean` (extend to the present, seam at 2012)
+
+For each raw-IPEDS finance-tail year ingested (2016, 2019), melt GASB (F1C\*) +
+FASB (F2E\*) function totals onto the **same** harmonized category labels as
+Delta, join EFIA 12-month FTE, and compute per-FTE + the core-spending SHARE with
+the identical in-pipeline denominator — so the raw tail stacks cleanly onto the
+Delta series. Then `spending_mix_clean` = **Delta national (1987-2012) UNION the
+raw-tail national (2013+)**, one row per **year × function** with a `source` seam
+flag (`delta` / `ipeds_raw`). **Footnote the 2012 seam on every chart using it.**
+"""
+)
+
+code(
+    r"""
+from src.clean_quality import FUNCTION_CROSSWALK
+
+# Which finance-tail years actually landed in 01-ingest (defensive — Source C may
+# have dropped a year).
+TAIL_YEARS = [y for y in (2016, 2019)
+              if f"ipeds_finance_gasb_{y}_raw" in {t[0] for t in con.execute("SHOW TABLES").fetchall()}]
+print("finance-tail years present:", TAIL_YEARS)
+assert TAIL_YEARS, "no finance-tail years available — Source C ingest missing"
+
+ft = cq.build_finance_tail_clean(con, TAIL_YEARS, FUNCTION_CROSSWALK)
+cq.quality_report(ft, "finance_tail_clean", con,
+                  required_columns=["unitid", "year", "function", "amount"], max_null_pct=0.6)
+cq.load_to_duckdb(ft, "finance_tail_clean", con)
+cq.save_interim(ft, cfg, "finance_tail_clean.parquet")
+print("finance_tail_clean:", ft.shape, "years", sorted(ft.year.unique().tolist()))
+
+mix = cq.build_spending_mix_clean(con)
+cq.quality_report(mix, "spending_mix_clean", con,
+                  required_columns=["year", "function", "share", "source"], max_null_pct=0.1)
+cq.load_to_duckdb(mix, "spending_mix_clean", con)
+cq.save_interim(mix, cfg, "spending_mix_clean.parquet")
+print("\nspending_mix_clean: years", int(mix.year.min()), "->", int(mix.year.max()),
+      "| sources", sorted(mix.source.unique().tolist()))
+"""
+)
+
+# --------------------------------------------------------------------------- D
+md(
+    r"""
+## Step D — `hr_staff_clean` + `hr_staff_national_clean` (admin vs faculty headcount, 2013→2022)
+
+For each IPEDS HR year (2013, 2016, 2019, 2022), aggregate staff headcount into
+**`admin_headcount`** (STAFFCAT 1300 = Management, FTPT=1) and
+**`faculty_headcount`** (STAFFCAT 1210 = Instructional staff, FTPT=1), one row per
+**unitid × year**, joined to EFIA 12-month FTE. Then a national aggregate
+(`hr_staff_national_clean`, one row per **year**) with summed headcounts, FTE, and
+**`admin_per_100_faculty`**.
+
+> ⭐ 2012-13 SOC-category break — this series is clean only from 2012-13 forward;
+> no pre-2012 crosswalk. Footnote the break on every chart using it.
+"""
+)
+
+code(
+    r"""
+HR_YEARS = [y for y in (2013, 2016, 2019, 2022)
+            if f"ipeds_hr_{y}_raw" in {t[0] for t in con.execute("SHOW TABLES").fetchall()}]
+print("HR years present:", HR_YEARS)
+assert HR_YEARS, "no HR years available — Source D ingest missing"
+
+hr = cq.build_hr_staff_clean(con, HR_YEARS)
+cq.quality_report(hr, "hr_staff_clean", con,
+                  required_columns=["unitid", "year", "admin_headcount", "faculty_headcount"],
+                  max_null_pct=0.6)
+cq.load_to_duckdb(hr, "hr_staff_clean", con)
+cq.save_interim(hr, cfg, "hr_staff_clean.parquet")
+
+hn = cq.build_hr_staff_national_clean(con)
+cq.quality_report(hn, "hr_staff_national_clean", con,
+                  required_columns=["year", "admin_headcount", "faculty_headcount"], max_null_pct=0.1)
+cq.load_to_duckdb(hn, "hr_staff_national_clean", con)
+cq.save_interim(hn, cfg, "hr_staff_national_clean.parquet")
+
+print("\nNational admin vs faculty headcount + FTE, by year:")
+print(hn.round(1).to_string(index=False))
+"""
+)
+
 # ---------------------------------------------------------------------------
 md(
     """
@@ -777,6 +955,77 @@ cq.get_sources(con)[["duckdb_table", "source_name"]]
 """
 )
 
+code(
+    r"""
+# REFRAME EXPANSION — _sources rows for the four new source families' _clean tables.
+cq.register_source(
+    con, table="tuition_longrun_clean",
+    name="NCES Digest Table 330.10 (tidy long)",
+    url="https://nces.ed.gov/programs/digest/d24/tables/dt24_330.10.asp",
+    license="Public domain (U.S. federal government work)",
+    notes="Tidy-long national tuition/fees/room/board by control×level×dollar-basis×component, 1963-64 -> latest.",
+    retrieved=RETRIEVED,
+    methodology="Light DuckDB typing of the already-long NCES 330.10 parse; constant-$ base = the Digest edition's base year.",
+    series_breaks=("National averages, not per-institution; room/board basis + institution universe shifted "
+                   "across Digest editions; constant-$ uses CPI-U All-Items (general, not tuition-specific); "
+                   "published (sticker) price, not net-of-aid."),
+)
+for t, nm, note in [
+    ("delta_spending_clean", "Delta Cost Project spending-by-function (per-institution)",
+     "unitid×year×function nominal $, per-FTE, and within-institution SHARE of core spending, public+private-nonprofit, 1987-2012."),
+    ("delta_spending_national_clean", "Delta Cost Project spending-by-function (national)",
+     "year×function national summed-$/summed-FTE per-FTE and national SHARE, 1987-2012 — the trend backbone."),
+]:
+    cq.register_source(
+        con, table=t, name=nm,
+        url="https://nces.ed.gov/ipeds/use-the-data/delta-cost-project-finance-data",
+        license="Public domain (U.S. federal government work)", notes=note, retrieved=RETRIEVED,
+        methodology=("NCES-harmonized CFI-method function totals (instruction01/research01/pubserv01/"
+                     "acadsupp01/studserv01/instsupp01) ÷ Delta constructed FTE; SHARE denominator = "
+                     "in-pipeline sum of the six core functions. Admin = institutional support only."),
+        series_breaks=("Delta is a DERIVED/imputed product (Jaquette & Parra); harmonizes FASB-1997/"
+                       "GASB-2002-04/Aligned-Form-2008-10 but ENDS 2011-12 (seam to the raw tail at 2012). "
+                       "Prefer SHARES over absolute per-FTE."),
+    )
+cq.register_source(
+    con, table="finance_tail_clean", name="Raw IPEDS finance tail (harmonized onto Delta categories)",
+    url="https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+    license="Public domain (U.S. federal government work)",
+    notes="Raw IPEDS GASB(F1C*)+FASB(F2E*) 2013-2021 melted onto Delta's category labels, per-FTE + core SHARE.",
+    retrieved=RETRIEVED,
+    methodology="Same crosswalk/denominator as the finance spine; EFIA 12-month FTE denominator; O&M excluded.",
+    series_breaks="Seam at 2011-12 (Delta ends, raw IPEDS tail begins). GASB isolates O&M; FASB distributes it.",
+)
+cq.register_source(
+    con, table="spending_mix_clean", name="Stacked national spending-by-function series (1987 -> latest)",
+    url="https://nces.ed.gov/ipeds/use-the-data/delta-cost-project-finance-data",
+    license="Public domain (U.S. federal government work)",
+    notes=("Delta national (1987-2012) UNION raw-IPEDS national (2013+), year×function with per_fte, share, "
+           "and a source seam flag. The table the spending-mix chart consumes."),
+    retrieved=RETRIEVED,
+    methodology="National summed-$/summed-FTE and summed-share; identical core-function denominator across the seam.",
+    series_breaks=("⭐ Seam at 2012 (source='delta' before, 'ipeds_raw' after). Honest reading: NON-"
+                   "INSTRUCTIONAL spending (student services + academic support + institutional support) "
+                   "outgrew instruction; institutional support (admin) ALONE is roughly flat."),
+)
+for t, nm, note in [
+    ("hr_staff_clean", "IPEDS HR admin vs faculty headcount (per-institution)",
+     "unitid×year admin_headcount (Management, STAFFCAT 1300) + faculty_headcount (Instructional, 1210) + EFIA FTE, 2013-2022."),
+    ("hr_staff_national_clean", "IPEDS HR admin vs faculty headcount (national)",
+     "year summed admin/faculty headcount + FTE + admin_per_100_faculty, 2013-2022."),
+]:
+    cq.register_source(
+        con, table=t, name=nm,
+        url="https://nces.ed.gov/ipeds/datacenter/DataFiles.aspx",
+        license="Public domain (U.S. federal government work)", notes=note, retrieved=RETRIEVED,
+        methodology="IPEDS Human Resources occupational categories (FTPT=1 all-staff HRTOTLT); EFIA FTE denominator.",
+        series_breaks=("⭐ HARD 2012-13 SOC-category break — clean only from 2012-13 forward; NO pre-2012 "
+                       "crosswalk. Over-time comparisons start at 2013."),
+    )
+print("Registered _sources for the 7 reframe-expansion _clean tables.")
+"""
+)
+
 # ---------------------------------------------------------------------------
 md(
     """
@@ -791,7 +1040,12 @@ code(
     r"""
 INTERIM = ["hd_clean", "finance_functions_clean", "finance_totals_clean",
            "fte_clean", "charges_clean", "net_price_clean", "cpi_clean",
-           "cpi_sectors_clean"]
+           "cpi_sectors_clean",
+           # REFRAME EXPANSION — the four new source families.
+           "tuition_longrun_clean",
+           "delta_spending_clean", "delta_spending_national_clean",
+           "finance_tail_clean", "spending_mix_clean",
+           "hr_staff_clean", "hr_staff_national_clean"]
 interim_dir = Path(cfg["paths"]["data_interim"])
 print(f"{'table':<28}{'parquet?':<10}{'db rows':>10}")
 print("-" * 48)

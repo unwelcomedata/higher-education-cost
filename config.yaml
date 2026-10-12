@@ -46,6 +46,24 @@ sources:
       F1112_F2:   "Finance FASB (private nonprofit) — expenses by function, FY2011-12"             # ipeds_finance_fasb_2012_raw
       EFFY2022:   "12-month unduplicated enrollment (for per-FTE normalization), 2021-22"          # ipeds_enrollment_2022_raw
       EFFY2012:   "12-month unduplicated enrollment (for per-FTE normalization), 2011-12"          # ipeds_enrollment_2012_raw
+      # --- REFRAME EXPANSION (2026-10): raw IPEDS finance tail + HR + EFIA ------
+      # Source C — raw IPEDS Finance tail to extend the spending mix 2012->2022.
+      # FY stem convention: FY2016 = F1516, FY2019 = F1819. Modern Aligned-Form
+      # F1C*/F2E* function codes (same as 2012/2022) confirmed present per year.
+      F1516_F1A:  "Finance GASB (public) — expenses by function, FY2015-16"                         # ipeds_finance_gasb_2016_raw
+      F1516_F2:   "Finance FASB (private nonprofit) — expenses by function, FY2015-16"              # ipeds_finance_fasb_2016_raw
+      EFIA2016:   "12-month instructional-activity FTE, 2015-16 (finance-tail denominator)"         # ipeds_fte_2016_raw
+      F1819_F1A:  "Finance GASB (public) — expenses by function, FY2018-19"                         # ipeds_finance_gasb_2019_raw
+      F1819_F2:   "Finance FASB (private nonprofit) — expenses by function, FY2018-19"              # ipeds_finance_fasb_2019_raw
+      EFIA2019:   "12-month instructional-activity FTE, 2018-19 (finance-tail denominator)"         # ipeds_fte_2019_raw
+      # Source D — IPEDS Human Resources staff-by-occupation (admin vs faculty).
+      # Clean window 2012-13 -> present ONLY (2012-13 SOC-category break; no pre-2012 crosswalk).
+      S2013_OC:   "HR staff by occupational category (SOC), 2012-13 — admin(1300) vs faculty(1210)"  # ipeds_hr_2013_raw
+      S2016_OC:   "HR staff by occupational category (SOC), 2015-16"                                  # ipeds_hr_2016_raw
+      S2019_OC:   "HR staff by occupational category (SOC), 2018-19"                                  # ipeds_hr_2019_raw
+      S2022_OC:   "HR staff by occupational category (SOC), 2021-22"                                  # ipeds_hr_2022_raw
+      EFIA2013:   "12-month instructional-activity FTE, 2012-13 (HR denominator)"                     # ipeds_fte_2013_raw
+      EFIA2022:   "12-month instructional-activity FTE, 2021-22 (HR denominator; also used by fte_clean)"  # ipeds_fte_2022_raw
 
   # --- College Scorecard (U.S. Dept. of Education) — modern cost + outcomes ---
   # Bulk data page: https://collegescorecard.ed.gov/data/
@@ -58,6 +76,26 @@ sources:
     url: "https://ed-public-download.scorecard.network/downloads/Most-Recent-Cohorts-Institution_05192025.zip"
     type: zip_csv
     js_render: false
+  # --- REFRAME EXPANSION (2026-10) ------------------------------------------
+  # Source A — NCES Digest Table 330.10: long tuition history 1963-64 -> latest,
+  # current + constant dollars, by control/level. The HTML page's multi-level
+  # table won't parse with read_html, so the table's companion Excel is used.
+  # The newest edition carrying the full 1963-64 series is auto-selected at build
+  # (d24 -> d23 -> d22). Lands in nces_tuition_longrun_raw.
+  nces_digest:
+    table_page: "https://nces.ed.gov/programs/digest/d24/tables/dt24_330.10.asp"
+    xlsx_url_tmpl: "https://nces.ed.gov/programs/digest/{edition}/tables/xls/tabn330.10.xlsx"
+    editions: ["d24", "d23", "d22"]
+    type: xlsx
+  # Source B — NCES Delta Cost Project Database 1987-2012 (harmonized finance).
+  # One ~115 MB zip of two CSVs (87-99 + 00-12). Loaded as a needed-column
+  # subset (file is 974 vars). Lands in delta_cost_raw. Derived product
+  # (Jaquette-Parra); ends 2011-12 (seam to the raw IPEDS tail at 2012).
+  delta_cost:
+    url: "https://nces.ed.gov/ipeds/deltacostproject/download/IPEDS_Analytics_DCP_87_12_CSV.zip"
+    docs_url: "https://nces.ed.gov/ipeds/deltacostproject/download/DCP_Data_File_Documentation_1987_2012.pdf"
+    landing: "https://nces.ed.gov/ipeds/use-the-data/delta-cost-project-finance-data"
+    type: zip_csv
 
   # --- BLS CPI-U — inflation adjustment --------------------------------------
   # NOTE: the flat-file host https://download.bls.gov/pub/time.series/cu/ returns
