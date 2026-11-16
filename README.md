@@ -1,6 +1,10 @@
 **[@unwelcomedata](https://github.com/unwelcomedata)** · data from public sources
 
 # We say "Big Pharma" and "Big Oil." Why not "Big Education"?
+[![Big Education — infographic](docs/infographic_higher_education_cost.png)](docs/infographic_higher_education_cost.png)
+
+---
+
 
 Since 1979, the price of college has out-run **general inflation** and **every
 other "big" sector** people complain about — healthcare, prescription drugs,
